@@ -24,17 +24,16 @@ const (
 
 type Fid struct {
 	fid     uint32
-	ref     int
 	cfid    uint32
 	offset  int
 	coffset int
+	ref     int // ref counting for freefid
 }
 
 type Msg struct {
 	c        *Conn
 	internal bool
 	sync     bool
-	ref      int
 	ctag     uint16
 	tag      uint16
 	tx       plan9.Fcall
@@ -43,9 +42,8 @@ type Msg struct {
 	newfid   *Fid
 	afid     *Fid
 	oldm     *Msg
-	next     *Msg
-	//tpkt     []byte
-	//rpkt     []byte
+	ref      int  // ref counting for freemsg
+	next     *Msg // in freemsg
 }
 
 type Conn struct {
@@ -200,10 +198,7 @@ func send9pError(m *Msg, ename string) {
 }
 
 func conninthread(c *Conn) {
-	var (
-		sync Msg
-		ok   bool
-	)
+	var ok bool
 
 	for {
 		m, err := mread9p(c.conn)
@@ -368,9 +363,10 @@ func conninthread(c *Conn) {
 	// but it might not have gotten a chance to msgput
 	// the very last one.  sync up to make sure.
 	//
-	sync.sync = true
-	sync.c = c
-	outq.send(&sync)
+	outq.send(&Msg{
+		sync: true,
+		c:    c,
+	})
 	<-c.outqdead
 
 	// everything is quiet; can close the local output queue.
@@ -409,20 +405,16 @@ func conninthread(c *Conn) {
 }
 
 func connoutthread(c *Conn) {
-	var (
-		err   bool
-		m, om *Msg
-	)
 
 	for {
-		m = c.outq.recv()
+		m := c.outq.recv()
 		if m == nil {
 			break
 		}
-		err = m.tx.Type+1 != m.rx.Type
+		badType := m.tx.Type+1 != m.rx.Type
 		switch m.tx.Type {
 		case plan9.Tflush:
-			om = m.oldm
+			om := m.oldm
 			if om != nil {
 				if deleteTag(om.c.tag, om.ctag, om) {
 					msgput(om)
@@ -437,7 +429,7 @@ func connoutthread(c *Conn) {
 			}
 
 		case plan9.Tauth:
-			if err && m.afid != nil {
+			if badType && m.afid != nil {
 				vprintf("auth error\n")
 				if deleteFid(m.c.fid, m.afid.cfid, m.afid) {
 					fidput(m.afid)
@@ -445,14 +437,14 @@ func connoutthread(c *Conn) {
 			}
 
 		case plan9.Tattach:
-			if err && m.fid != nil {
+			if badType && m.fid != nil {
 				if deleteFid(m.c.fid, m.fid.cfid, m.fid) {
 					fidput(m.fid)
 				}
 			}
 
 		case plan9.Twalk:
-			if err || len(m.rx.Wqid) < len(m.tx.Wname) {
+			if badType || len(m.rx.Wqid) < len(m.tx.Wname) {
 				if m.tx.Fid != m.tx.Newfid && m.newfid != nil {
 					if deleteFid(m.c.fid, m.newfid.cfid, m.newfid) {
 						fidput(m.newfid)
@@ -572,8 +564,10 @@ func fidput(f *Fid) {
 }
 
 var (
-	msgtab  []*Msg
-	nmsg    int
+	msgtab []*Msg
+	nmsg   int
+	// Normally we'd use a sync.Pool here,
+	// but it conflicts with how we're computing Msg.tag
 	freemsg *Msg
 )
 
