@@ -28,8 +28,6 @@ type Fid struct {
 	cfid    uint32
 	offset  int
 	coffset int
-	//isdir   bool
-	next *Fid
 }
 
 type Msg struct {
@@ -464,9 +462,8 @@ func connoutthread(c *Conn) {
 
 		case plan9.Tread:
 		case plan9.Tstat:
-
-		case plan9.Topen, plan9.Tcreate:
-			//m.fid.isdir = (m.rx.Qid.Type & plan9.QTDIR) != 0
+		case plan9.Topen:
+		case plan9.Tcreate:
 		}
 		if deleteTag(m.c.tag, m.ctag, m) {
 			msgput(m)
@@ -545,23 +542,19 @@ func inputthread() {
 	os.Exit(0)
 }
 
-var (
-	fidtab  []Fid
-	freefid *Fid
-)
+var freefid = sync.Pool{
+	New: func() interface{} {
+		return &Fid{
+			ref:     1,
+			offset:  0,
+			coffset: 0,
+		}
+	},
+}
 
 func fidnew(cfid uint32) *Fid {
-	if freefid == nil {
-		fidtab = append(fidtab, Fid{})
-		freefid = &fidtab[len(fidtab)-1]
-	}
-	f := freefid
-	freefid = f.next
+	f := freefid.Get().(*Fid)
 	f.cfid = cfid
-	f.ref = 1
-	f.offset = 0
-	f.coffset = 0
-	//f.isdir = -1
 	return f
 }
 
@@ -574,9 +567,8 @@ func fidput(f *Fid) {
 	if f.ref > 0 {
 		return
 	}
-	f.next = freefid
 	f.cfid = ^uint32(0)
-	freefid = f
+	freefid.Put(f)
 }
 
 var (
