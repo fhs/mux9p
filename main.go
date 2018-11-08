@@ -3,6 +3,23 @@
 // It is a port of Plan 9 Port's 9pserve program.
 package main
 
+// Life cycle of a 9P message:
+//
+// 1. conninthread:
+//		read from Conn into Msg.tx
+//		writes global tags and fids to Msg.tx
+//		send Msg to outq
+// 2. outputthread:
+//		receive from outq
+//		write Msg.tx to stdout
+// 3. inputthread:
+//		read from stdin into Msg.rx
+//		writes Conn's tag to Msg.rx
+//		send Msg to Conn.outq
+// 4. connoutthread:
+//		receive from Conn.outq
+//		write Msg.rx to Conn
+
 import (
 	"flag"
 	"fmt"
@@ -17,17 +34,15 @@ import (
 	"9fans.net/go/plan9"
 )
 
-const (
-	STACK  = 32768
-	MAXMSG = 64 // per connection
-)
+const MAXMSG = 64 // per connection
 
 type Fid struct {
 	fid     uint32
 	cfid    uint32
 	offset  int
 	coffset int
-	ref     int // ref counting for freefid
+	ref     int  // ref counting for freefid
+	next    *Fid // next in freefid
 }
 
 type Msg struct {
@@ -59,7 +74,7 @@ type Conn struct {
 }
 
 var (
-	outq      *Queue // stdout Msg queue
+	outq      *Queue
 	msize     uint32 = 8092
 	versioned bool
 
@@ -201,7 +216,7 @@ func conninthread(c *Conn) {
 		if err != nil {
 			break
 		}
-		vvprintf("fd#%d -> %F\n", c.conn, &m.tx)
+		vvprintf("fd#%d -> %v\n", c.conn, &m.tx)
 		m.c = c
 		m.ctag = m.tx.Tag
 		c.nmsg++
@@ -454,12 +469,11 @@ func connoutthread(c *Conn) {
 		if deleteTag(m.c.tag, m.ctag, m) {
 			msgput(m)
 		}
-		vvprintf("fd#%d <- %F\n", c.conn, &m.rx)
+		vvprintf("fd#%d <- %v\n", c.conn, &m.rx)
 		rpkt, err := m.rx.Bytes()
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
-		rewritehdr(&m.rx, rpkt)
 		if _, err := c.conn.Write(rpkt); err != nil {
 			vprintf("write error: %v\n", err)
 		}
@@ -487,7 +501,6 @@ func outputthread() {
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
-		rewritehdr(&m.tx, tpkt)
 		if _, err := os.Stdout.Write(tpkt); err != nil {
 			log.Fatalf("output error: %s\n", err)
 		}
@@ -528,19 +541,24 @@ func inputthread() {
 	os.Exit(0)
 }
 
-var freefid = sync.Pool{
-	New: func() interface{} {
-		return &Fid{
-			ref:     1,
-			offset:  0,
-			coffset: 0,
-		}
-	},
-}
+var (
+	fidtab  []*Fid
+	freefid *Fid
+)
 
 func fidnew(cfid uint32) *Fid {
-	f := freefid.Get().(*Fid)
+	if freefid == nil {
+		freefid = &Fid{
+			fid: uint32(len(fidtab)),
+		}
+		fidtab = append(fidtab, freefid)
+	}
+	f := freefid
+	freefid = f.next
 	f.cfid = cfid
+	f.ref = 1
+	f.offset = 0
+	f.coffset = 0
 	return f
 }
 
@@ -553,15 +571,14 @@ func fidput(f *Fid) {
 	if f.ref > 0 {
 		return
 	}
+	f.next = freefid
 	f.cfid = ^uint32(0)
-	freefid.Put(f)
+	freefid = f
 }
 
 var (
-	msgtab []*Msg
-	nmsg   int
-	// Normally we'd use a sync.Pool here,
-	// but it conflicts with how we're computing Msg.tag
+	msgtab  []*Msg
+	nmsg    int
 	freemsg *Msg
 )
 
@@ -705,51 +722,6 @@ func mread9p(r io.Reader) (*Msg, error) {
 	return m, nil
 }
 
-func rewritehdr(f *plan9.Fcall, pkt []byte) {
-	i := 4 + 1 // length + Type
-	i += pbit16(pkt[i:], f.Tag)
-	switch f.Type {
-	case plan9.Tversion, plan9.Rversion:
-		i += 4
-		i += pstring(pkt[i:], f.Version)
-
-	case plan9.Tauth:
-		i += pbit32(pkt[i:], f.Afid)
-		i += pstring(pkt[i:], f.Uname)
-		i += pstring(pkt[i:], f.Aname)
-
-	case plan9.Tflush:
-		i += pbit16(pkt[i:], f.Oldtag)
-
-	case plan9.Tattach:
-		i += pbit32(pkt[i:], f.Fid)
-		i += pbit32(pkt[i:], f.Afid)
-		i += pstring(pkt[i:], f.Uname)
-		i += pstring(pkt[i:], f.Aname)
-
-	case plan9.Twalk:
-		i += pbit32(pkt[i:], f.Fid)
-		i += pbit32(pkt[i:], f.Newfid)
-		i += 2
-		for _, wname := range f.Wname {
-			i += pstring(pkt[i:], wname)
-		}
-
-	case plan9.Tcreate:
-		pstring(pkt[i+4:], f.Name)
-		fallthrough
-	case plan9.Topen, plan9.Tclunk, plan9.Tremove, plan9.Tstat, plan9.Twstat, plan9.Twrite:
-		i += pbit32(pkt[i:], f.Fid)
-
-	case plan9.Tread:
-		i += pbit32(pkt[i:], f.Fid)
-		i += pbit64(pkt[i:], f.Offset)
-
-	case plan9.Rerror:
-		i += pstring(pkt[i:], f.Ename)
-	}
-}
-
 /*
 int
 ignorepipe(void *v, char *s)
@@ -761,7 +733,7 @@ ignorepipe(void *v, char *s)
 		return 1;
 	if(strcmp(s, "sys: window size change") == 0)
 		return 1;
-	fprint(2, "9pserve %s: %T note: %s\n", addr, s);
+	fprint(2, "9pserve %s: note: %s\n", addr, s);
 	return 0;
 }
 */
