@@ -32,18 +32,18 @@ type Fid struct {
 
 type Msg struct {
 	c        *Conn
-	internal bool
-	sync     bool
-	ctag     uint16
-	tag      uint16
-	tx       plan9.Fcall
-	rx       plan9.Fcall
+	internal bool        // Tflush or Tclunk used for clean up
+	sync     bool        // used to signal outputthread we're done
+	ctag     uint16      // Conn's tag
+	tag      uint16      // unique tag over all Conns
+	tx       plan9.Fcall // transmit
+	rx       plan9.Fcall // receive
 	fid      *Fid
-	newfid   *Fid
-	afid     *Fid
-	oldm     *Msg
+	newfid   *Fid // Twalk Newfid
+	afid     *Fid // Tauth Fid
+	oldm     *Msg // Msg corresponding to Tflush Oldtag
 	ref      int  // ref counting for freemsg
-	next     *Msg // in freemsg
+	next     *Msg // next in freemsg
 }
 
 type Conn struct {
@@ -55,13 +55,11 @@ type Conn struct {
 	tag          map[uint16]*Msg
 	fid          map[uint32]*Fid
 	outq         *Queue
-	inq          *Queue
 	outqdead     chan struct{}
 }
 
 var (
 	outq      *Queue // stdout Msg queue
-	inq       *Queue // stdin Msg queue
 	msize     uint32 = 8092
 	versioned bool
 
@@ -121,7 +119,6 @@ func mainproc(ln net.Listener) {
 	//atnotify(ignorepipe, 1)
 
 	outq = newQueue()
-	inq = newQueue()
 
 	f := new(plan9.Fcall)
 	if !versioned {
@@ -165,7 +162,6 @@ func listenthread(ln net.Listener) {
 		}
 		c.inc = make(chan struct{})
 		c.internal = make(chan *Msg)
-		c.inq = newQueue()
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
@@ -336,7 +332,7 @@ func conninthread(c *Conn) {
 	// flush all outstanding messages
 	for _, om := range c.tag {
 		msgincref(om) // for us
-		m := msgnew(0)
+		m := msgnew()
 		m.internal = true
 		m.c = c
 		c.nmsg++
@@ -349,7 +345,7 @@ func conninthread(c *Conn) {
 		sendomsg(m)
 		mm := <-c.internal
 		assert(mm == m)
-		msgput(m) // got from recvp
+		msgput(m) // got from chan
 		msgput(m) // got from msgnew
 		if deleteTag(c.tag, om.ctag, om) {
 			msgput(om) // got from hash table
@@ -378,7 +374,7 @@ func conninthread(c *Conn) {
 
 	// clunk all outstanding fids
 	for _, f := range c.fid {
-		m := msgnew(0)
+		m := msgnew()
 		m.internal = true
 		m.c = c
 		c.nmsg++
@@ -392,7 +388,7 @@ func conninthread(c *Conn) {
 		mm := <-c.internal
 		assert(mm == m)
 		msgclear(m)
-		msgput(m) // got from recvp
+		msgput(m) // got from chan
 		msgput(m) // got from msgnew
 		fidput(f) // got from hash table
 	}
@@ -401,11 +397,9 @@ func conninthread(c *Conn) {
 	c.conn.Close()
 	close(c.internal)
 	close(c.inc)
-	c.inq = nil
 }
 
 func connoutthread(c *Conn) {
-
 	for {
 		m := c.outq.recv()
 		if m == nil {
@@ -577,7 +571,7 @@ func msgincref(m *Msg) {
 	m.ref++
 }
 
-func msgnew(x int) *Msg {
+func msgnew() *Msg {
 	if freemsg == nil {
 		freemsg = &Msg{
 			tag: uint16(len(msgtab)),
@@ -706,7 +700,7 @@ func mread9p(r io.Reader) (*Msg, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := msgnew(0)
+	m := msgnew()
 	m.tx = *f
 	return m, nil
 }
