@@ -51,7 +51,7 @@ type Msg struct {
 }
 
 type Conn struct {
-	fd           net.Conn
+	conn         net.Conn
 	nmsg         int
 	inc          chan struct{}
 	internal     chan *Msg
@@ -64,9 +64,9 @@ type Conn struct {
 }
 
 var (
-	outq      *Queue
-	inq       *Queue
-	msize     uint32
+	outq      *Queue // stdout Msg queue
+	inq       *Queue // stdin Msg queue
+	msize     uint32 = 8092
 	versioned bool
 
 	noauth  = flag.Bool("n", false, "no authentication; respond to Tauth messages with an error")
@@ -162,7 +162,7 @@ func listenthread(ln net.Listener) {
 	for {
 		var c Conn
 		var err error
-		c.fd, err = ln.Accept()
+		c.conn, err = ln.Accept()
 		if err != nil {
 			vprintf("listen: %v\n", err)
 			return
@@ -172,8 +172,9 @@ func listenthread(ln net.Listener) {
 		c.inq = newQueue()
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
-		vprintf("incoming call on %v\n", c.fd.LocalAddr())
-		go connthread(&c)
+		vprintf("incoming call on %v\n", c.conn.LocalAddr())
+		go conninthread(&c)
+		go connoutthread(&c)
 	}
 }
 
@@ -200,23 +201,22 @@ func send9pError(m *Msg, ename string) {
 	send9pmsg(m)
 }
 
-func connthread(c *Conn) {
+func conninthread(c *Conn) {
 	var (
 		sync Msg
 		ok   bool
 	)
 
-	go connoutthread(c)
 	for {
-		m, err := mread9p(c.fd)
+		m, err := mread9p(c.conn)
 		if err != nil {
 			break
 		}
-		vvprintf("fd#%d -> %F\n", c.fd, &m.tx)
+		vvprintf("fd#%d -> %F\n", c.conn, &m.tx)
 		m.c = c
 		m.ctag = m.tx.Tag
 		c.nmsg++
-		vvprintf("fd#%d: new msg %p\n", c.fd, m)
+		vvprintf("fd#%d: new msg %p\n", c.conn, m)
 		if _, ok := c.tag[m.tx.Tag]; ok {
 			send9pError(m, "duplicate tag")
 			continue
@@ -338,7 +338,7 @@ func connthread(c *Conn) {
 			<-c.inc
 		}
 	}
-	vprintf("fd#%d eof; flushing conn\n", c.fd)
+	vprintf("fd#%d eof; flushing conn\n", c.conn)
 
 	// flush all outstanding messages
 	for _, om := range c.tag {
@@ -404,7 +404,7 @@ func connthread(c *Conn) {
 	}
 
 	assert(c.nmsg == 0)
-	c.fd.Close()
+	c.conn.Close()
 	close(c.internal)
 	close(c.inc)
 	c.inq = nil
@@ -471,13 +471,13 @@ func connoutthread(c *Conn) {
 		if deleteTag(m.c.tag, m.ctag, m) {
 			msgput(m)
 		}
-		vvprintf("fd#%d <- %F\n", c.fd, &m.rx)
+		vvprintf("fd#%d <- %F\n", c.conn, &m.rx)
 		rpkt, err := m.rx.Bytes()
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
 		rewritehdr(&m.rx, rpkt)
-		if _, err := c.fd.Write(rpkt); err != nil {
+		if _, err := c.conn.Write(rpkt); err != nil {
 			vprintf("write error: %v\n", err)
 		}
 		msgput(m)
