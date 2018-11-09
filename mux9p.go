@@ -1,7 +1,7 @@
 // This program announces and multiplexes a 9P service.
 //
 // It is a port of Plan 9 Port's 9pserve program.
-package main
+package mux9p
 
 // Life cycle of a 9P message:
 //
@@ -21,18 +21,21 @@ package main
 //		write Msg.rx to Conn
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 
 	"9fans.net/go/plan9"
 )
+
+type Config struct {
+	NoAuth  bool
+	Logging bool
+}
 
 const MAXMSG = 64 // per connection
 
@@ -75,60 +78,42 @@ var (
 	outq      *Queue // Msg queue
 	msize     uint32 = 8092
 	versioned bool
-
-	noauth  = flag.Bool("n", false, "no authentication; respond to Tauth messages with an error")
-	verbose = flag.Int("v", 0, "verbosity")
-	logging = flag.Bool("l", false, "logging; write a debugging log to addr.log")
+	verbose   int // maybe make this part of Config later
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: 9pserve [flags] address\n")
-	fmt.Fprintf(os.Stderr, "\treads/writes 9P messages on stdin/stdout\n")
-	fmt.Fprintf(os.Stderr, "\n")
-	flag.PrintDefaults()
-	os.Exit(2)
-}
-
-func main() {
+func Listen(network, address string, cfg *Config) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
 	x := os.Getenv("verbose9pserve")
 	if x != "" {
 		var err error
-		*verbose, err = strconv.Atoi(x)
+		verbose, err = strconv.Atoi(x)
 		if err != nil {
-			*verbose = 0
+			verbose = 0
 		}
 		fmt.Fprintf(os.Stderr, "verbose9pserve %s => %d\n", x, verbose)
 	}
 
-	flag.Parse()
-	if flag.NArg() != 1 {
-		usage()
-	}
-	addr := flag.Arg(0)
-
-	network, netaddr := parseAddr(addr)
-	ln, err := net.Listen(network, netaddr)
+	ln, err := net.Listen(network, address)
 	if err != nil {
 		log.Fatalf("listen failed: %v\n", err)
 	}
 	defer ln.Close()
 
-	if *logging {
-		if strings.HasPrefix(addr, "unix!") {
-			addr = addr[len("unix!"):]
-		}
-		f, err := os.Create(fmt.Sprintf("%s.log", addr))
+	if cfg.Logging {
+		f, err := os.Create(fmt.Sprintf("%s.log", address))
 		if err != nil {
 			log.Fatalf("create failed: %v", err)
 		}
 		defer f.Close()
 		log.SetOutput(f)
 	}
-	vprintf("9pserve running\n")
-	mainproc(ln)
+	cfg.mainproc(ln)
 }
 
-func mainproc(ln net.Listener) {
+func (cfg *Config) mainproc(ln net.Listener) {
+	vprintf("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
 	outq = newQueue()
@@ -161,10 +146,10 @@ func mainproc(ln net.Listener) {
 	go inputthread()
 	go outputthread()
 
-	listenthread(ln)
+	cfg.listenthread(ln)
 }
 
-func listenthread(ln net.Listener) {
+func (cfg *Config) listenthread(ln net.Listener) {
 	for {
 		var c Conn
 		var err error
@@ -178,7 +163,7 @@ func listenthread(ln net.Listener) {
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
-		go conninthread(&c)
+		go cfg.conninthread(&c)
 		go connoutthread(&c)
 	}
 }
@@ -198,7 +183,7 @@ func send9pError(m *Msg, ename string) {
 	send9pmsg(m)
 }
 
-func conninthread(c *Conn) {
+func (cfg *Config) conninthread(c *Conn) {
 	var ok bool
 
 	for {
@@ -282,7 +267,7 @@ func conninthread(c *Conn) {
 			}
 
 		case plan9.Tauth:
-			if *noauth {
+			if cfg.NoAuth {
 				send9pError(m, "authentication rejected")
 				continue
 			}
@@ -721,25 +706,14 @@ ignorepipe(void *v, char *s)
 }
 */
 
-func parseAddr(dial string) (net, addr string) {
-	if dial == "" {
-		panic("empty dial string")
-	}
-	f := strings.SplitN(dial, "!", 3)
-	if f[0] == "net" {
-		panic("unsupported network net")
-	}
-	return f[0], strings.Join(f[1:], ":")
-}
-
 func vprintf(format string, a ...interface{}) {
-	if *verbose > 0 {
+	if verbose > 0 {
 		log.Printf(format, a...)
 	}
 }
 
 func vvprintf(format string, a ...interface{}) {
-	if *verbose > 1 {
+	if verbose > 1 {
 		log.Printf(format, a...)
 	}
 }
