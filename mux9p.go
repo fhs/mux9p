@@ -35,6 +35,8 @@ import (
 type Config struct {
 	NoAuth  bool
 	Logging bool
+	Reader  io.Reader
+	Writer  io.Writer
 }
 
 const MAXMSG = 64 // per connection
@@ -78,12 +80,18 @@ var (
 	outq      *Queue // Msg queue
 	msize     uint32 = 8092
 	versioned bool
-	verbose   int // maybe make this part of Config later
+	verbose   = 2 // maybe make this part of Config later
 )
 
 func Listen(network, address string, cfg *Config) {
 	if cfg == nil {
 		cfg = &Config{}
+	}
+	if cfg.Reader == nil {
+		cfg.Reader = os.Stdin
+	}
+	if cfg.Writer == nil {
+		cfg.Reader = os.Stdout
 	}
 	x := os.Getenv("verbose9pserve")
 	if x != "" {
@@ -128,23 +136,23 @@ func (cfg *Config) mainproc(ln net.Listener) {
 		if err != nil {
 			log.Fatalf("Fcall conversion to bytes failed: %v", err)
 		}
-		vvprintf("* <- %v\n", &f)
-		_, err = os.Stdout.Write(vbuf)
+		vvprintf("* <- %v\n", f)
+		_, err = cfg.Writer.Write(vbuf)
 		if err != nil {
 			log.Fatalf("error writing Tversion: %v", err)
 		}
-		f, err = plan9.ReadFcall(os.Stdin)
+		f, err = plan9.ReadFcall(cfg.Reader)
 		if err != nil {
 			log.Fatalf("ReadFcall failed: %v", err)
 		}
 		if f.Msize < msize {
 			msize = f.Msize
 		}
-		vvprintf("* -> %v\n", &f)
+		vvprintf("* -> %v\n", f)
 	}
 
-	go inputthread()
-	go outputthread()
+	go cfg.inputthread()
+	go cfg.outputthread()
 
 	cfg.listenthread(ln)
 }
@@ -461,7 +469,7 @@ func connoutthread(c *Conn) {
 	c.outqdead <- struct{}{}
 }
 
-func outputthread() {
+func (cfg *Config) outputthread() {
 	for {
 		m := outq.recv()
 		if m == nil {
@@ -476,7 +484,7 @@ func outputthread() {
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
-		if _, err := os.Stdout.Write(tpkt); err != nil {
+		if _, err := cfg.Writer.Write(tpkt); err != nil {
 			log.Fatalf("output error: %s\n", err)
 		}
 		msgput(m)
@@ -485,11 +493,11 @@ func outputthread() {
 	os.Exit(0)
 }
 
-func inputthread() {
+func (cfg *Config) inputthread() {
 	vprintf("input thread\n")
 
 	for {
-		f, err := plan9.ReadFcall(os.Stdin)
+		f, err := plan9.ReadFcall(cfg.Reader)
 		if err == io.EOF {
 			break
 		}
