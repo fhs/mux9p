@@ -37,6 +37,10 @@ type Config struct {
 	Logging bool
 	Reader  io.Reader
 	Writer  io.Writer
+
+	outq      *Queue // Msg queue
+	msize     uint32
+	versioned bool
 }
 
 const MAXMSG = 64 // per connection
@@ -77,10 +81,7 @@ type Conn struct {
 }
 
 var (
-	outq      *Queue // Msg queue
-	msize     uint32 = 8092
-	versioned bool
-	verbose   = 2 // maybe make this part of Config later
+	verbose = 2 // maybe make this part of Config later
 )
 
 func Listen(network, address string, cfg *Config) {
@@ -91,7 +92,7 @@ func Listen(network, address string, cfg *Config) {
 		cfg.Reader = os.Stdin
 	}
 	if cfg.Writer == nil {
-		cfg.Reader = os.Stdout
+		cfg.Writer = os.Stdout
 	}
 	x := os.Getenv("verbose9pserve")
 	if x != "" {
@@ -117,6 +118,9 @@ func Listen(network, address string, cfg *Config) {
 		defer f.Close()
 		log.SetOutput(f)
 	}
+
+	cfg.outq = newQueue()
+	cfg.msize = 8092
 	cfg.mainproc(ln)
 }
 
@@ -124,13 +128,11 @@ func (cfg *Config) mainproc(ln net.Listener) {
 	vprintf("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
-	outq = newQueue()
-
 	f := new(plan9.Fcall)
-	if !versioned {
+	if !cfg.versioned {
 		f.Type = plan9.Tversion
 		f.Version = "9P2000"
-		f.Msize = msize
+		f.Msize = cfg.msize
 		f.Tag = plan9.NOTAG
 		vbuf, err := f.Bytes()
 		if err != nil {
@@ -145,8 +147,8 @@ func (cfg *Config) mainproc(ln net.Listener) {
 		if err != nil {
 			log.Fatalf("ReadFcall failed: %v", err)
 		}
-		if f.Msize < msize {
-			msize = f.Msize
+		if f.Msize < cfg.msize {
+			cfg.msize = f.Msize
 		}
 		vvprintf("* -> %v\n", f)
 	}
@@ -170,6 +172,8 @@ func (cfg *Config) listenthread(ln net.Listener) {
 		c.internal = make(chan *Msg)
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
+		c.tag = make(map[uint16]*Msg)
+		c.fid = make(map[uint32]*Fid)
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
 		go cfg.conninthread(&c)
 		go connoutthread(&c)
@@ -180,8 +184,8 @@ func send9pmsg(m *Msg) {
 	m.c.outq.send(m)
 }
 
-func sendomsg(m *Msg) {
-	outq.send(m)
+func (cfg *Config) sendomsg(m *Msg) {
+	cfg.outq.send(m)
 }
 
 func send9pError(m *Msg, ename string) {
@@ -215,8 +219,8 @@ func (cfg *Config) conninthread(c *Conn) {
 		case plan9.Tversion:
 			m.rx.Tag = m.tx.Tag
 			m.rx.Msize = m.tx.Msize
-			if m.rx.Msize > msize {
-				m.rx.Msize = msize
+			if m.rx.Msize > cfg.msize {
+				m.rx.Msize = cfg.msize
 			}
 			m.rx.Version = "9P2000"
 			m.rx.Type = plan9.Rversion
@@ -319,7 +323,7 @@ func (cfg *Config) conninthread(c *Conn) {
 			m.tx.Oldtag = m.oldm.tag
 		}
 		// reference passes to outq
-		outq.send(m)
+		cfg.outq.send(m)
 		for c.nmsg >= MAXMSG {
 			c.inputstalled = true
 			<-c.inc
@@ -340,7 +344,7 @@ func (cfg *Config) conninthread(c *Conn) {
 		m.oldm = om
 		msgincref(om)
 		msgincref(m) // for outq
-		sendomsg(m)
+		cfg.sendomsg(m)
 		mm := <-c.internal
 		assert(mm == m)
 		msgput(m) // got from chan
@@ -357,7 +361,7 @@ func (cfg *Config) conninthread(c *Conn) {
 	// but it might not have gotten a chance to msgput
 	// the very last one.  sync up to make sure.
 	//
-	outq.send(&Msg{
+	cfg.outq.send(&Msg{
 		sync: true,
 		c:    c,
 	})
@@ -382,7 +386,7 @@ func (cfg *Config) conninthread(c *Conn) {
 		m.fid = f
 		f.ref++
 		msgincref(m)
-		sendomsg(m)
+		cfg.sendomsg(m)
 		mm := <-c.internal
 		assert(mm == m)
 		msgclear(m)
@@ -471,7 +475,7 @@ func connoutthread(c *Conn) {
 
 func (cfg *Config) outputthread() {
 	for {
-		m := outq.recv()
+		m := cfg.outq.recv()
 		if m == nil {
 			break
 		}
