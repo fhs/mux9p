@@ -7,14 +7,14 @@ package main
 //
 // 1. conninthread:
 //		read from Conn into Msg.tx
-//		writes global tags and fids to Msg.tx
+//		write global tags and fids to Msg.tx
 //		send Msg to outq
 // 2. outputthread:
 //		receive from outq
 //		write Msg.tx to stdout
 // 3. inputthread:
 //		read from stdin into Msg.rx
-//		writes Conn's tag to Msg.rx
+//		write Conn's tag to Msg.rx
 //		send Msg to Conn.outq
 // 4. connoutthread:
 //		receive from Conn.outq
@@ -37,12 +37,10 @@ import (
 const MAXMSG = 64 // per connection
 
 type Fid struct {
-	fid     uint32
-	cfid    uint32
-	offset  int
-	coffset int
-	ref     int  // ref counting for freefid
-	next    *Fid // next in freefid
+	fid  uint32
+	cfid uint32 // Conn's fid
+	ref  int    // ref counting for freefid
+	next *Fid   // next in freefid
 }
 
 type Msg struct {
@@ -53,28 +51,28 @@ type Msg struct {
 	tag      uint16      // unique tag over all Conns
 	tx       plan9.Fcall // transmit
 	rx       plan9.Fcall // receive
-	fid      *Fid
-	newfid   *Fid // Twalk Newfid
-	afid     *Fid // Tauth Fid
-	oldm     *Msg // Msg corresponding to Tflush Oldtag
-	ref      int  // ref counting for freemsg
-	next     *Msg // next in freemsg
+	fid      *Fid        // Tattach, Twalk, etc.
+	newfid   *Fid        // Twalk Newfid
+	afid     *Fid        // Tauth Fid
+	oldm     *Msg        // Msg corresponding to Tflush Oldtag
+	ref      int         // ref counting for freemsg
+	next     *Msg        // next in freemsg
 }
 
 type Conn struct {
 	conn         net.Conn
-	nmsg         int
-	inc          chan struct{}
-	internal     chan *Msg
-	inputstalled bool
-	tag          map[uint16]*Msg
-	fid          map[uint32]*Fid
-	outq         *Queue
-	outqdead     chan struct{}
+	nmsg         int             // number of outstanding messages
+	inc          chan struct{}   // continue if inputstalled
+	internal     chan *Msg       // used to send internal Msgs
+	inputstalled bool            // too many messages being processed
+	tag          map[uint16]*Msg // conn tag → global tag
+	fid          map[uint32]*Fid // conn fid → global fid
+	outq         *Queue          // Msg queue
+	outqdead     chan struct{}   // done using outq or Conn.outq
 }
 
 var (
-	outq      *Queue
+	outq      *Queue // Msg queue
 	msize     uint32 = 8092
 	versioned bool
 
@@ -186,18 +184,10 @@ func listenthread(ln net.Listener) {
 }
 
 func send9pmsg(m *Msg) {
-	//rpkt, err := m.rx.Bytes()
-	//if err != nil {
-	//	log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
-	//}
 	m.c.outq.send(m)
 }
 
 func sendomsg(m *Msg) {
-	//tpkt, err := m.tx.Bytes()
-	//if err != nil {
-	//	log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
-	//}
 	outq.send(m)
 }
 
@@ -528,7 +518,6 @@ func inputthread() {
 		}
 		m.rx = *f
 		vvprintf("* -> %v internal=%v\n", &m.rx, m.internal)
-		//m.rpkt = pkt
 		m.rx.Tag = m.ctag
 		if m.internal {
 			m.c.internal <- m
@@ -557,8 +546,6 @@ func fidnew(cfid uint32) *Fid {
 	freefid = f.next
 	f.cfid = cfid
 	f.ref = 1
-	f.offset = 0
-	f.coffset = 0
 	return f
 }
 
@@ -603,14 +590,10 @@ func msgnew() *Msg {
 	return m
 }
 
-//
-// Clear data associated with connections, so that
-// if all msgs have been msgcleared, the connection
-// can be freed.  Note that this does *not* free the tpkt
-// and rpkt; they are freed in msgput with the msg itself.
+// Msgclear clears data associated with connections, so that
+// if all msgs have been msgcleared, the connection can be freed.
 // The io write thread might still be holding a ref to msg
 // even once the connection has finished with it.
-//
 func msgclear(m *Msg) {
 	if m.c != nil {
 		m.c.nmsg--
