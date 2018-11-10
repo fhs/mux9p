@@ -38,7 +38,7 @@ type Config struct {
 	Reader  io.Reader
 	Writer  io.Writer
 
-	outq      *Queue // msg queue
+	outq      *queue // msg queue
 	msize     uint32
 	versioned bool
 
@@ -83,7 +83,7 @@ type conn struct {
 	inputstalled bool            // too many messages being processed
 	tag          map[uint16]*msg // conn tag → global tag
 	fid          map[uint32]*fid // conn fid → global fid
-	outq         *Queue          // msg queue
+	outq         *queue          // msg queue
 	outqdead     chan struct{}   // done using outq or Conn.outq
 }
 
@@ -642,26 +642,26 @@ func (cfg *Config) msgget(n int) *msg {
 	return m
 }
 
-type Qel struct {
-	next *Qel
+type qElem struct {
+	next *qElem
 	p    *msg
 }
 
-type Queue struct {
+type queue struct {
 	lk   sync.Mutex
 	r    *sync.Cond
-	head *Qel
-	tail *Qel
+	head *qElem
+	tail *qElem
 }
 
-func newQueue() *Queue {
-	var q Queue
+func newQueue() *queue {
+	var q queue
 	q.r = sync.NewCond(&q.lk)
 	return &q
 }
 
-func (q *Queue) send(p *msg) int {
-	var e Qel
+func (q *queue) send(p *msg) int {
+	var e qElem
 
 	q.lk.Lock()
 	e.p = p
@@ -677,7 +677,7 @@ func (q *Queue) send(p *msg) int {
 	return 0
 }
 
-func (q *Queue) recv() *msg {
+func (q *queue) recv() *msg {
 	q.lk.Lock()
 	for q.head == nil {
 		q.r.Wait()
