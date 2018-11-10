@@ -1,6 +1,9 @@
-// This program announces and multiplexes a 9P service.
+// Package mux9p implements a multiplexer a 9P service.
 //
-// It is a port of Plan 9 Port's 9pserve program.
+// It is a port of Plan 9 Port's 9pserve program
+// (https://9fans.github.io/plan9port/man/man4/9pserve.html)
+// and can be used instead of 9pserve in a 9P server written in Go.
+//
 package mux9p
 
 // Life cycle of a 9P message:
@@ -11,9 +14,9 @@ package mux9p
 //		send msg to Config.outq
 // 2. outputthread:
 //		receive from Config.outq
-//		write msg.tx to Config.Writer
+//		write msg.tx to Config.srv
 // 3. inputthread:
-//		read from Config.Reader into msg.rx
+//		read from Config.srv into msg.rx
 //		write conn's tag to msg.rx
 //		send msg to conn.outq
 // 4. connoutthread:
@@ -32,9 +35,17 @@ import (
 	"9fans.net/go/plan9"
 )
 
+// Config contains options for the 9P multiplexer.
 type Config struct {
-	NoAuth   bool
-	Logger   *log.Logger
+	// No authentication. Respond to Tauth messages with an error.
+	NoAuth bool
+
+	// Logs are written here. It's set to the standard logger if nil.
+	Logger *log.Logger
+
+	// Sets the verbosity of the log.
+	// Logs are not written if it's 0.
+	// It can be overridden with environment variable verbose9pserve.
 	LogLevel int
 
 	srv       io.ReadWriter
@@ -87,35 +98,40 @@ type conn struct {
 	outqdead     chan struct{}   // done using outq or Conn.outq
 }
 
-func Listen(network, address string, srv io.ReadWriter, cfg *Config) {
+// Listen creates a listener at the given network and address,
+// accepts 9P clients from it and mutiplexes them into 9P server srv.
+func Listen(network, address string, srv io.ReadWriter, cfg *Config) error {
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	return Do(ln, srv, cfg)
+}
+
+// Do accepts 9P clients from listener ln and mutiplexes them into 9P server srv.
+func Do(ln net.Listener, srv io.ReadWriter, cfg *Config) error {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	x := os.Getenv("verbose9pserve")
-	if x != "" {
+	if cfg.Logger == nil {
+		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+	if x := os.Getenv("verbose9pserve"); x != "" {
 		n, err := strconv.Atoi(x)
 		if err == nil {
 			cfg.LogLevel = n
 			fmt.Fprintf(os.Stderr, "verbose9pserve %s => %d\n", x, cfg.LogLevel)
 		}
 	}
-
-	ln, err := net.Listen(network, address)
-	if err != nil {
-		log.Fatalf("listen failed: %v\n", err)
-	}
-	defer ln.Close()
-
-	if cfg.Logger == nil {
-		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
-	}
 	cfg.srv = srv
 	cfg.outq = newQueue()
 	cfg.msize = 8092
-	cfg.mainproc(ln)
+	return cfg.mainproc(ln)
 }
 
-func (cfg *Config) mainproc(ln net.Listener) {
+func (cfg *Config) mainproc(ln net.Listener) error {
 	cfg.log("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
@@ -128,16 +144,19 @@ func (cfg *Config) mainproc(ln net.Listener) {
 		}
 		vbuf, err := f.Bytes()
 		if err != nil {
-			log.Fatalf("Fcall conversion to bytes failed: %v", err)
+			cfg.log("Fcall conversion to bytes failed: %v", err)
+			return err
 		}
 		cfg.log2("* <- %v\n", f)
 		_, err = cfg.srv.Write(vbuf)
 		if err != nil {
-			log.Fatalf("error writing Tversion: %v", err)
+			cfg.log("error writing Tversion: %v", err)
+			return err
 		}
 		f, err = plan9.ReadFcall(cfg.srv)
 		if err != nil {
-			log.Fatalf("ReadFcall failed: %v", err)
+			cfg.log("ReadFcall failed: %v", err)
+			return err
 		}
 		if f.Msize < cfg.msize {
 			cfg.msize = f.Msize
@@ -148,17 +167,17 @@ func (cfg *Config) mainproc(ln net.Listener) {
 	go cfg.inputthread()
 	go cfg.outputthread()
 
-	cfg.listenthread(ln)
+	return cfg.listenthread(ln)
 }
 
-func (cfg *Config) listenthread(ln net.Listener) {
+func (cfg *Config) listenthread(ln net.Listener) error {
 	for {
 		var c conn
 		var err error
 		c.conn, err = ln.Accept()
 		if err != nil {
 			cfg.log("listen: %v\n", err)
-			return
+			return err
 		}
 		c.inc = make(chan struct{})
 		c.internal = make(chan *msg)

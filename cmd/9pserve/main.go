@@ -1,8 +1,10 @@
+// This program announces and multiplexes a 9P service.
 package main
 
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -31,9 +33,16 @@ func main() {
 	addr := flag.Arg(0)
 
 	network, address := parseAddr(addr)
-	mux9p.Listen(network, address, &mux9p.Config{
-		NoAuth:  *noauth,
-		Logging: *logging,
+
+	f, err := os.Create(fmt.Sprintf("%s.log", address))
+	if err != nil {
+		log.Fatalf("create failed: %v", err)
+	}
+	defer f.Close()
+
+	mux9p.Listen(network, address, stdio{}, &mux9p.Config{
+		NoAuth: *noauth,
+		Logger: log.New(f, "", log.LstdFlags),
 	})
 }
 
@@ -47,3 +56,8 @@ func parseAddr(dial string) (net, addr string) {
 	}
 	return f[0], strings.Join(f[1:], ":")
 }
+
+type stdio struct{}
+
+func (s stdio) Read(b []byte) (int, error)  { return s.Read(b) }
+func (s stdio) Write(b []byte) (int, error) { return s.Write(b) }
