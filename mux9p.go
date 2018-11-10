@@ -34,7 +34,7 @@ import (
 
 type Config struct {
 	NoAuth   bool
-	Logging  bool
+	Logger   *log.Logger
 	LogLevel int
 
 	srv       io.ReadWriter
@@ -106,15 +106,9 @@ func Listen(network, address string, srv io.ReadWriter, cfg *Config) {
 	}
 	defer ln.Close()
 
-	if cfg.Logging {
-		f, err := os.Create(fmt.Sprintf("%s.log", address))
-		if err != nil {
-			log.Fatalf("create failed: %v", err)
-		}
-		defer f.Close()
-		log.SetOutput(f)
+	if cfg.Logger == nil {
+		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
-
 	cfg.srv = srv
 	cfg.outq = newQueue()
 	cfg.msize = 8092
@@ -707,13 +701,13 @@ ignorepipe(void *v, char *s)
 
 func (cfg *Config) vprintf(format string, a ...interface{}) {
 	if cfg.LogLevel > 0 {
-		log.Printf(format, a...)
+		cfg.Logger.Printf(format, a...)
 	}
 }
 
 func (cfg *Config) vvprintf(format string, a ...interface{}) {
 	if cfg.LogLevel > 1 {
-		log.Printf(format, a...)
+		cfg.Logger.Printf(format, a...)
 	}
 }
 

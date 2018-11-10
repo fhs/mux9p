@@ -135,7 +135,9 @@ func TestListen(t *testing.T) {
 
 	network := "unix"
 	address := filepath.Join(dir, "testsrv.sock")
-	go Listen(network, address, muxSrv, nil)
+	go Listen(network, address, muxSrv, &Config{
+		LogLevel: 2,
+	})
 
 	replayLog(t, versionLog, srv, nil)
 
