@@ -4,7 +4,7 @@
 
 ## Overview
 
-This is a Go package for that multiplexes a 9P service. It's a port of [9pserve](https://9fans.github.io/plan9port/man/man4/9pserve.html).
+This is a Go package for multiplexing a 9P service. It's a port of [9pserve](https://9fans.github.io/plan9port/man/man4/9pserve.html).
 
 ## Installation
 
