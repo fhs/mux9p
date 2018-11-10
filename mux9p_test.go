@@ -131,13 +131,11 @@ func TestListen(t *testing.T) {
 	r, tx := io.Pipe()
 	defer tx.Close()
 	srv := &readWriter{rx, tx}
+	muxSrv := &readWriter{r, w}
 
 	network := "unix"
 	address := filepath.Join(dir, "testsrv.sock")
-	go Listen(network, address, &Config{
-		Reader: r,
-		Writer: w,
-	})
+	go Listen(network, address, muxSrv, nil)
 
 	replayLog(t, versionLog, srv, nil)
 

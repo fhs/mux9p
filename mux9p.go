@@ -35,9 +35,8 @@ import (
 type Config struct {
 	NoAuth  bool
 	Logging bool
-	Reader  io.Reader
-	Writer  io.Writer
 
+	srv       io.ReadWriter
 	outq      *queue // msg queue
 	msize     uint32
 	versioned bool
@@ -91,15 +90,9 @@ var (
 	verbose = 2 // maybe make this part of Config later
 )
 
-func Listen(network, address string, cfg *Config) {
+func Listen(network, address string, srv io.ReadWriter, cfg *Config) {
 	if cfg == nil {
 		cfg = &Config{}
-	}
-	if cfg.Reader == nil {
-		cfg.Reader = os.Stdin
-	}
-	if cfg.Writer == nil {
-		cfg.Writer = os.Stdout
 	}
 	x := os.Getenv("verbose9pserve")
 	if x != "" {
@@ -126,6 +119,7 @@ func Listen(network, address string, cfg *Config) {
 		log.SetOutput(f)
 	}
 
+	cfg.srv = srv
 	cfg.outq = newQueue()
 	cfg.msize = 8092
 	cfg.mainproc(ln)
@@ -147,11 +141,11 @@ func (cfg *Config) mainproc(ln net.Listener) {
 			log.Fatalf("Fcall conversion to bytes failed: %v", err)
 		}
 		vvprintf("* <- %v\n", f)
-		_, err = cfg.Writer.Write(vbuf)
+		_, err = cfg.srv.Write(vbuf)
 		if err != nil {
 			log.Fatalf("error writing Tversion: %v", err)
 		}
-		f, err = plan9.ReadFcall(cfg.Reader)
+		f, err = plan9.ReadFcall(cfg.srv)
 		if err != nil {
 			log.Fatalf("ReadFcall failed: %v", err)
 		}
@@ -496,7 +490,7 @@ func (cfg *Config) outputthread() {
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
-		if _, err := cfg.Writer.Write(tpkt); err != nil {
+		if _, err := cfg.srv.Write(tpkt); err != nil {
 			log.Fatalf("output error: %s\n", err)
 		}
 		cfg.msgput(m)
@@ -509,7 +503,7 @@ func (cfg *Config) inputthread() {
 	vprintf("input thread\n")
 
 	for {
-		f, err := plan9.ReadFcall(cfg.Reader)
+		f, err := plan9.ReadFcall(cfg.srv)
 		if err == io.EOF {
 			break
 		}
