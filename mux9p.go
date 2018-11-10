@@ -6,19 +6,19 @@ package mux9p
 // Life cycle of a 9P message:
 //
 // 1. conninthread:
-//		read from conn into Msg.tx
-//		write global tags and fids to Msg.tx
-//		send Msg to Config.outq
+//		read from conn into msg.tx
+//		write global tags and fids to msg.tx
+//		send msg to Config.outq
 // 2. outputthread:
 //		receive from Config.outq
-//		write Msg.tx to Config.Writer
+//		write msg.tx to Config.Writer
 // 3. inputthread:
-//		read from Config.Reader into Msg.rx
-//		write conn's tag to Msg.rx
-//		send Msg to conn.outq
+//		read from Config.Reader into msg.rx
+//		write conn's tag to msg.rx
+//		send msg to conn.outq
 // 4. connoutthread:
 //		receive from conn.outq
-//		write Msg.rx to conn
+//		write msg.rx to conn
 
 import (
 	"fmt"
@@ -38,16 +38,16 @@ type Config struct {
 	Reader  io.Reader
 	Writer  io.Writer
 
-	outq      *Queue // Msg queue
+	outq      *Queue // msg queue
 	msize     uint32
 	versioned bool
 
 	fidtab  []*fid
 	freefid *fid
 
-	msgtab  []*Msg
+	msgtab  []*msg
 	nmsg    int
-	freemsg *Msg
+	freemsg *msg
 }
 
 const maxMsgPerConn = 64
@@ -59,7 +59,7 @@ type fid struct {
 	next *fid   // next in freefid
 }
 
-type Msg struct {
+type msg struct {
 	c        *conn
 	internal bool        // Tflush or Tclunk used for clean up
 	sync     bool        // used to signal outputthread we're done
@@ -70,20 +70,20 @@ type Msg struct {
 	fid      *fid        // Tattach, Twalk, etc.
 	newfid   *fid        // Twalk Newfid
 	afid     *fid        // Tauth Fid
-	oldm     *Msg        // Msg corresponding to Tflush Oldtag
+	oldm     *msg        // msg corresponding to Tflush Oldtag
 	ref      int         // ref counting for freemsg
-	next     *Msg        // next in freemsg
+	next     *msg        // next in freemsg
 }
 
 type conn struct {
 	conn         net.Conn
 	nmsg         int             // number of outstanding messages
 	inc          chan struct{}   // continue if inputstalled
-	internal     chan *Msg       // used to send internal Msgs
+	internal     chan *msg       // used to send internal msgs
 	inputstalled bool            // too many messages being processed
-	tag          map[uint16]*Msg // conn tag → global tag
+	tag          map[uint16]*msg // conn tag → global tag
 	fid          map[uint32]*fid // conn fid → global fid
-	outq         *Queue          // Msg queue
+	outq         *Queue          // msg queue
 	outqdead     chan struct{}   // done using outq or Conn.outq
 }
 
@@ -177,10 +177,10 @@ func (cfg *Config) listenthread(ln net.Listener) {
 			return
 		}
 		c.inc = make(chan struct{})
-		c.internal = make(chan *Msg)
+		c.internal = make(chan *msg)
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
-		c.tag = make(map[uint16]*Msg)
+		c.tag = make(map[uint16]*msg)
 		c.fid = make(map[uint32]*fid)
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
 		go cfg.conninthread(&c)
@@ -188,15 +188,15 @@ func (cfg *Config) listenthread(ln net.Listener) {
 	}
 }
 
-func send9pmsg(m *Msg) {
+func send9pmsg(m *msg) {
 	m.c.outq.send(m)
 }
 
-func (cfg *Config) sendomsg(m *Msg) {
+func (cfg *Config) sendomsg(m *msg) {
 	cfg.outq.send(m)
 }
 
-func send9pError(m *Msg, ename string) {
+func send9pError(m *msg, ename string) {
 	m.rx.Type = plan9.Rerror
 	m.rx.Ename = ename
 	m.rx.Tag = m.tx.Tag
@@ -369,7 +369,7 @@ func (cfg *Config) conninthread(c *conn) {
 	// but it might not have gotten a chance to msgput
 	// the very last one.  sync up to make sure.
 	//
-	cfg.outq.send(&Msg{
+	cfg.outq.send(&msg{
 		sync: true,
 		c:    c,
 	})
@@ -563,15 +563,15 @@ func (cfg *Config) fidput(f *fid) {
 	cfg.freefid = f
 }
 
-func msgincref(m *Msg) {
+func msgincref(m *msg) {
 	vvprintf("msgincref %p tag %d/%d ref %d=>%d\n",
 		m, m.tag, m.ctag, m.ref, m.ref+1)
 	m.ref++
 }
 
-func (cfg *Config) msgnew() *Msg {
+func (cfg *Config) msgnew() *msg {
 	if cfg.freemsg == nil {
-		cfg.freemsg = &Msg{
+		cfg.freemsg = &msg{
 			tag: uint16(len(cfg.msgtab)),
 		}
 		cfg.msgtab = append(cfg.msgtab, cfg.freemsg)
@@ -584,11 +584,11 @@ func (cfg *Config) msgnew() *Msg {
 	return m
 }
 
-// Msgclear clears data associated with connections, so that
+// msgclear clears data associated with connections, so that
 // if all msgs have been msgcleared, the connection can be freed.
 // The io write thread might still be holding a ref to msg
 // even once the connection has finished with it.
-func (cfg *Config) msgclear(m *Msg) {
+func (cfg *Config) msgclear(m *msg) {
 	if m.c != nil {
 		m.c.nmsg--
 		m.c = nil
@@ -611,7 +611,7 @@ func (cfg *Config) msgclear(m *Msg) {
 	}
 }
 
-func (cfg *Config) msgput(m *Msg) {
+func (cfg *Config) msgput(m *msg) {
 	if m == nil {
 		return
 	}
@@ -629,7 +629,7 @@ func (cfg *Config) msgput(m *Msg) {
 	cfg.freemsg = m
 }
 
-func (cfg *Config) msgget(n int) *Msg {
+func (cfg *Config) msgget(n int) *msg {
 	if n < 0 || n >= len(cfg.msgtab) {
 		return nil
 	}
@@ -644,7 +644,7 @@ func (cfg *Config) msgget(n int) *Msg {
 
 type Qel struct {
 	next *Qel
-	p    *Msg
+	p    *msg
 }
 
 type Queue struct {
@@ -660,7 +660,7 @@ func newQueue() *Queue {
 	return &q
 }
 
-func (q *Queue) send(p *Msg) int {
+func (q *Queue) send(p *msg) int {
 	var e Qel
 
 	q.lk.Lock()
@@ -677,7 +677,7 @@ func (q *Queue) send(p *Msg) int {
 	return 0
 }
 
-func (q *Queue) recv() *Msg {
+func (q *Queue) recv() *msg {
 	q.lk.Lock()
 	for q.head == nil {
 		q.r.Wait()
@@ -689,7 +689,7 @@ func (q *Queue) recv() *Msg {
 	return p
 }
 
-func (cfg *Config) mread9p(r io.Reader) (*Msg, error) {
+func (cfg *Config) mread9p(r io.Reader) (*msg, error) {
 	f, err := plan9.ReadFcall(r)
 	if err != nil {
 		return nil, err
@@ -733,7 +733,7 @@ func assert(b bool) {
 	}
 }
 
-func deleteTag(tab map[uint16]*Msg, tag uint16, m *Msg) bool {
+func deleteTag(tab map[uint16]*msg, tag uint16, m *msg) bool {
 	if m1, ok := tab[tag]; ok {
 		if m1 != m {
 			vprintf("deleteTag %d got %p want %p\n", tag, m1, m)
