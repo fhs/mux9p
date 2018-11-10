@@ -116,7 +116,7 @@ func Listen(network, address string, srv io.ReadWriter, cfg *Config) {
 }
 
 func (cfg *Config) mainproc(ln net.Listener) {
-	cfg.vprintf("9pserve running\n")
+	cfg.log("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
 	if !cfg.versioned {
@@ -130,7 +130,7 @@ func (cfg *Config) mainproc(ln net.Listener) {
 		if err != nil {
 			log.Fatalf("Fcall conversion to bytes failed: %v", err)
 		}
-		cfg.vvprintf("* <- %v\n", f)
+		cfg.log2("* <- %v\n", f)
 		_, err = cfg.srv.Write(vbuf)
 		if err != nil {
 			log.Fatalf("error writing Tversion: %v", err)
@@ -142,7 +142,7 @@ func (cfg *Config) mainproc(ln net.Listener) {
 		if f.Msize < cfg.msize {
 			cfg.msize = f.Msize
 		}
-		cfg.vvprintf("* -> %v\n", f)
+		cfg.log2("* -> %v\n", f)
 	}
 
 	go cfg.inputthread()
@@ -157,7 +157,7 @@ func (cfg *Config) listenthread(ln net.Listener) {
 		var err error
 		c.conn, err = ln.Accept()
 		if err != nil {
-			cfg.vprintf("listen: %v\n", err)
+			cfg.log("listen: %v\n", err)
 			return
 		}
 		c.inc = make(chan struct{})
@@ -166,7 +166,7 @@ func (cfg *Config) listenthread(ln net.Listener) {
 		c.outqdead = make(chan struct{})
 		c.tag = make(map[uint16]*msg)
 		c.fid = make(map[uint32]*fid)
-		cfg.vprintf("incoming call on %v\n", c.conn.LocalAddr())
+		cfg.log("incoming call on %v\n", c.conn.LocalAddr())
 		go cfg.conninthread(&c)
 		go cfg.connoutthread(&c)
 	}
@@ -195,11 +195,11 @@ func (cfg *Config) conninthread(c *conn) {
 		if err != nil {
 			break
 		}
-		cfg.vvprintf("fd#%d -> %v\n", c.conn, &m.tx)
+		cfg.log2("fd#%d -> %v\n", c.conn, &m.tx)
 		m.c = c
 		m.ctag = m.tx.Tag
 		c.nmsg++
-		cfg.vvprintf("fd#%d: new msg %p\n", c.conn, m)
+		cfg.log2("fd#%d: new msg %p\n", c.conn, m)
 		if _, ok := c.tag[m.tx.Tag]; ok {
 			send9pError(m, "duplicate tag")
 			continue
@@ -321,7 +321,7 @@ func (cfg *Config) conninthread(c *conn) {
 			<-c.inc
 		}
 	}
-	cfg.vprintf("fd#%d eof; flushing conn\n", c.conn)
+	cfg.log("fd#%d eof; flushing conn\n", c.conn)
 
 	// flush all outstanding messages
 	for _, om := range c.tag {
@@ -418,7 +418,7 @@ func (cfg *Config) connoutthread(c *conn) {
 
 		case plan9.Tauth:
 			if badType && m.afid != nil {
-				cfg.vprintf("auth error\n")
+				cfg.log("auth error\n")
 				if cfg.deleteFid(m.c.fid, m.afid.cfid, m.afid) {
 					cfg.fidput(m.afid)
 				}
@@ -448,13 +448,13 @@ func (cfg *Config) connoutthread(c *conn) {
 		if cfg.deleteTag(m.c.tag, m.ctag, m) {
 			cfg.msgput(m)
 		}
-		cfg.vvprintf("fd#%d <- %v\n", c.conn, &m.rx)
+		cfg.log2("fd#%d <- %v\n", c.conn, &m.rx)
 		rpkt, err := m.rx.Bytes()
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
 		if _, err := c.conn.Write(rpkt); err != nil {
-			cfg.vprintf("write error: %v\n", err)
+			cfg.log("write error: %v\n", err)
 		}
 		cfg.msgput(m)
 		if c.inputstalled && c.nmsg < maxMsgPerConn {
@@ -475,7 +475,7 @@ func (cfg *Config) outputthread() {
 			m.c.outqdead <- struct{}{}
 			continue
 		}
-		cfg.vvprintf("* <- %v\n", &m.tx)
+		cfg.log2("* <- %v\n", &m.tx)
 		tpkt, err := m.tx.Bytes()
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
@@ -490,7 +490,7 @@ func (cfg *Config) outputthread() {
 }
 
 func (cfg *Config) inputthread() {
-	cfg.vprintf("input thread\n")
+	cfg.log("input thread\n")
 
 	for {
 		f, err := plan9.ReadFcall(cfg.srv)
@@ -506,7 +506,7 @@ func (cfg *Config) inputthread() {
 			continue
 		}
 		m.rx = *f
-		cfg.vvprintf("* -> %v internal=%v\n", &m.rx, m.internal)
+		cfg.log2("* -> %v internal=%v\n", &m.rx, m.internal)
 		m.rx.Tag = m.ctag
 		if m.internal {
 			m.c.internal <- m
@@ -548,7 +548,7 @@ func (cfg *Config) fidput(f *fid) {
 }
 
 func (cfg *Config) msgincref(m *msg) {
-	cfg.vvprintf("msgincref %p tag %d/%d ref %d=>%d\n",
+	cfg.log2("msgincref %p tag %d/%d ref %d=>%d\n",
 		m, m.tag, m.ctag, m.ref, m.ref+1)
 	m.ref++
 }
@@ -563,7 +563,7 @@ func (cfg *Config) msgnew() *msg {
 	m := cfg.freemsg
 	cfg.freemsg = m.next
 	m.ref = 1
-	cfg.vvprintf("msgnew %p tag %d ref %d\n", m, m.tag, m.ref)
+	cfg.log2("msgnew %p tag %d ref %d\n", m, m.tag, m.ref)
 	cfg.nmsg++
 	return m
 }
@@ -599,7 +599,7 @@ func (cfg *Config) msgput(m *msg) {
 	if m == nil {
 		return
 	}
-	cfg.vvprintf("msgput %p tag %d/%d ref %d\n",
+	cfg.log2("msgput %p tag %d/%d ref %d\n",
 		m, m.tag, m.ctag, m.ref)
 	assert(m.ref > 0)
 	m.ref--
@@ -621,7 +621,7 @@ func (cfg *Config) msgget(n int) *msg {
 	if m.ref == 0 {
 		return nil
 	}
-	cfg.vprintf("msgget %d = %p\n", n, m)
+	cfg.log("msgget %d = %p\n", n, m)
 	cfg.msgincref(m)
 	return m
 }
@@ -699,13 +699,13 @@ ignorepipe(void *v, char *s)
 }
 */
 
-func (cfg *Config) vprintf(format string, a ...interface{}) {
+func (cfg *Config) log(format string, a ...interface{}) {
 	if cfg.LogLevel > 0 {
 		cfg.Logger.Printf(format, a...)
 	}
 }
 
-func (cfg *Config) vvprintf(format string, a ...interface{}) {
+func (cfg *Config) log2(format string, a ...interface{}) {
 	if cfg.LogLevel > 1 {
 		cfg.Logger.Printf(format, a...)
 	}
@@ -720,7 +720,7 @@ func assert(b bool) {
 func (cfg *Config) deleteTag(tab map[uint16]*msg, tag uint16, m *msg) bool {
 	if m1, ok := tab[tag]; ok {
 		if m1 != m {
-			cfg.vprintf("deleteTag %d got %p want %p\n", tag, m1, m)
+			cfg.log("deleteTag %d got %p want %p\n", tag, m1, m)
 		}
 		delete(tab, tag)
 		return true
@@ -731,7 +731,7 @@ func (cfg *Config) deleteTag(tab map[uint16]*msg, tag uint16, m *msg) bool {
 func (cfg *Config) deleteFid(tab map[uint32]*fid, fid uint32, f *fid) bool {
 	if f1, ok := tab[fid]; ok {
 		if f1 != f {
-			cfg.vprintf("deleteFid %d got %p want %p\n", fid, f1, f)
+			cfg.log("deleteFid %d got %p want %p\n", fid, f1, f)
 		}
 		delete(tab, fid)
 		return true
