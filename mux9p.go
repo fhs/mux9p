@@ -42,8 +42,8 @@ type Config struct {
 	msize     uint32
 	versioned bool
 
-	fidtab  []*Fid
-	freefid *Fid
+	fidtab  []*fid
+	freefid *fid
 
 	msgtab  []*Msg
 	nmsg    int
@@ -52,11 +52,11 @@ type Config struct {
 
 const maxMsgPerConn = 64
 
-type Fid struct {
+type fid struct {
 	fid  uint32
 	cfid uint32 // Conn's fid
 	ref  int    // ref counting for freefid
-	next *Fid   // next in freefid
+	next *fid   // next in freefid
 }
 
 type Msg struct {
@@ -67,9 +67,9 @@ type Msg struct {
 	tag      uint16      // unique tag over all Conns
 	tx       plan9.Fcall // transmit
 	rx       plan9.Fcall // receive
-	fid      *Fid        // Tattach, Twalk, etc.
-	newfid   *Fid        // Twalk Newfid
-	afid     *Fid        // Tauth Fid
+	fid      *fid        // Tattach, Twalk, etc.
+	newfid   *fid        // Twalk Newfid
+	afid     *fid        // Tauth Fid
 	oldm     *Msg        // Msg corresponding to Tflush Oldtag
 	ref      int         // ref counting for freemsg
 	next     *Msg        // next in freemsg
@@ -82,7 +82,7 @@ type conn struct {
 	internal     chan *Msg       // used to send internal Msgs
 	inputstalled bool            // too many messages being processed
 	tag          map[uint16]*Msg // conn tag → global tag
-	fid          map[uint32]*Fid // conn fid → global fid
+	fid          map[uint32]*fid // conn fid → global fid
 	outq         *Queue          // Msg queue
 	outqdead     chan struct{}   // done using outq or Conn.outq
 }
@@ -181,7 +181,7 @@ func (cfg *Config) listenthread(ln net.Listener) {
 		c.outq = newQueue()
 		c.outqdead = make(chan struct{})
 		c.tag = make(map[uint16]*Msg)
-		c.fid = make(map[uint32]*Fid)
+		c.fid = make(map[uint32]*fid)
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
 		go cfg.conninthread(&c)
 		go cfg.connoutthread(&c)
@@ -535,9 +535,9 @@ func (cfg *Config) inputthread() {
 	os.Exit(0)
 }
 
-func (cfg *Config) fidnew(cfid uint32) *Fid {
+func (cfg *Config) fidnew(cfid uint32) *fid {
 	if cfg.freefid == nil {
-		cfg.freefid = &Fid{
+		cfg.freefid = &fid{
 			fid: uint32(len(cfg.fidtab)),
 		}
 		cfg.fidtab = append(cfg.fidtab, cfg.freefid)
@@ -549,7 +549,7 @@ func (cfg *Config) fidnew(cfid uint32) *Fid {
 	return f
 }
 
-func (cfg *Config) fidput(f *Fid) {
+func (cfg *Config) fidput(f *fid) {
 	if f == nil {
 		return
 	}
@@ -744,7 +744,7 @@ func deleteTag(tab map[uint16]*Msg, tag uint16, m *Msg) bool {
 	return false
 }
 
-func deleteFid(tab map[uint32]*Fid, fid uint32, f *Fid) bool {
+func deleteFid(tab map[uint32]*fid, fid uint32, f *fid) bool {
 	if f1, ok := tab[fid]; ok {
 		if f1 != f {
 			vprintf("deleteFid %d got %p want %p\n", fid, f1, f)
