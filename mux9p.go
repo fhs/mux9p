@@ -6,19 +6,19 @@ package mux9p
 // Life cycle of a 9P message:
 //
 // 1. conninthread:
-//		read from Conn into Msg.tx
+//		read from conn into Msg.tx
 //		write global tags and fids to Msg.tx
-//		send Msg to outq
+//		send Msg to Config.outq
 // 2. outputthread:
-//		receive from outq
-//		write Msg.tx to stdout
+//		receive from Config.outq
+//		write Msg.tx to Config.Writer
 // 3. inputthread:
-//		read from stdin into Msg.rx
-//		write Conn's tag to Msg.rx
-//		send Msg to Conn.outq
+//		read from Config.Reader into Msg.rx
+//		write conn's tag to Msg.rx
+//		send Msg to conn.outq
 // 4. connoutthread:
-//		receive from Conn.outq
-//		write Msg.rx to Conn
+//		receive from conn.outq
+//		write Msg.rx to conn
 
 import (
 	"fmt"
@@ -50,7 +50,7 @@ type Config struct {
 	freemsg *Msg
 }
 
-const MAXMSG = 64 // per connection
+const maxMsgPerConn = 64
 
 type Fid struct {
 	fid  uint32
@@ -60,7 +60,7 @@ type Fid struct {
 }
 
 type Msg struct {
-	c        *Conn
+	c        *conn
 	internal bool        // Tflush or Tclunk used for clean up
 	sync     bool        // used to signal outputthread we're done
 	ctag     uint16      // Conn's tag
@@ -75,7 +75,7 @@ type Msg struct {
 	next     *Msg        // next in freemsg
 }
 
-type Conn struct {
+type conn struct {
 	conn         net.Conn
 	nmsg         int             // number of outstanding messages
 	inc          chan struct{}   // continue if inputstalled
@@ -169,7 +169,7 @@ func (cfg *Config) mainproc(ln net.Listener) {
 
 func (cfg *Config) listenthread(ln net.Listener) {
 	for {
-		var c Conn
+		var c conn
 		var err error
 		c.conn, err = ln.Accept()
 		if err != nil {
@@ -203,7 +203,7 @@ func send9pError(m *Msg, ename string) {
 	send9pmsg(m)
 }
 
-func (cfg *Config) conninthread(c *Conn) {
+func (cfg *Config) conninthread(c *conn) {
 	var ok bool
 
 	for {
@@ -332,7 +332,7 @@ func (cfg *Config) conninthread(c *Conn) {
 		}
 		// reference passes to outq
 		cfg.outq.send(m)
-		for c.nmsg >= MAXMSG {
+		for c.nmsg >= maxMsgPerConn {
 			c.inputstalled = true
 			<-c.inc
 		}
@@ -409,7 +409,7 @@ func (cfg *Config) conninthread(c *Conn) {
 	close(c.inc)
 }
 
-func (cfg *Config) connoutthread(c *Conn) {
+func (cfg *Config) connoutthread(c *conn) {
 	for {
 		m := c.outq.recv()
 		if m == nil {
@@ -473,7 +473,7 @@ func (cfg *Config) connoutthread(c *Conn) {
 			vprintf("write error: %v\n", err)
 		}
 		cfg.msgput(m)
-		if c.inputstalled && c.nmsg < MAXMSG {
+		if c.inputstalled && c.nmsg < maxMsgPerConn {
 			c.inc <- struct{}{}
 		}
 	}
