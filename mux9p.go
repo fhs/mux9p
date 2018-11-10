@@ -44,6 +44,10 @@ type Config struct {
 
 	fidtab  []*Fid
 	freefid *Fid
+
+	msgtab  []*Msg
+	nmsg    int
+	freemsg *Msg
 }
 
 const MAXMSG = 64 // per connection
@@ -203,7 +207,7 @@ func (cfg *Config) conninthread(c *Conn) {
 	var ok bool
 
 	for {
-		m, err := mread9p(c.conn)
+		m, err := cfg.mread9p(c.conn)
 		if err != nil {
 			break
 		}
@@ -338,7 +342,7 @@ func (cfg *Config) conninthread(c *Conn) {
 	// flush all outstanding messages
 	for _, om := range c.tag {
 		msgincref(om) // for us
-		m := msgnew()
+		m := cfg.msgnew()
 		m.internal = true
 		m.c = c
 		c.nmsg++
@@ -380,7 +384,7 @@ func (cfg *Config) conninthread(c *Conn) {
 
 	// clunk all outstanding fids
 	for _, f := range c.fid {
-		m := msgnew()
+		m := cfg.msgnew()
 		m.internal = true
 		m.c = c
 		c.nmsg++
@@ -512,7 +516,7 @@ func (cfg *Config) inputthread() {
 		if err != nil {
 			log.Fatalf("ReadFcall failed: %v", err)
 		}
-		m := msgget(int(f.Tag))
+		m := cfg.msgget(int(f.Tag))
 		if m == nil {
 			log.Printf("unexpected 9P response tag %v\n", f.Tag)
 			continue
@@ -559,30 +563,24 @@ func (cfg *Config) fidput(f *Fid) {
 	cfg.freefid = f
 }
 
-var (
-	msgtab  []*Msg
-	nmsg    int
-	freemsg *Msg
-)
-
 func msgincref(m *Msg) {
 	vvprintf("msgincref %p tag %d/%d ref %d=>%d\n",
 		m, m.tag, m.ctag, m.ref, m.ref+1)
 	m.ref++
 }
 
-func msgnew() *Msg {
-	if freemsg == nil {
-		freemsg = &Msg{
-			tag: uint16(len(msgtab)),
+func (cfg *Config) msgnew() *Msg {
+	if cfg.freemsg == nil {
+		cfg.freemsg = &Msg{
+			tag: uint16(len(cfg.msgtab)),
 		}
-		msgtab = append(msgtab, freemsg)
+		cfg.msgtab = append(cfg.msgtab, cfg.freemsg)
 	}
-	m := freemsg
-	freemsg = m.next
+	m := cfg.freemsg
+	cfg.freemsg = m.next
 	m.ref = 1
 	vvprintf("msgnew %p tag %d ref %d\n", m, m.tag, m.ref)
-	nmsg++
+	cfg.nmsg++
 	return m
 }
 
@@ -624,18 +622,18 @@ func (cfg *Config) msgput(m *Msg) {
 	if m.ref > 0 {
 		return
 	}
-	nmsg--
+	cfg.nmsg--
 	cfg.msgclear(m)
 	m.internal = false
-	m.next = freemsg
-	freemsg = m
+	m.next = cfg.freemsg
+	cfg.freemsg = m
 }
 
-func msgget(n int) *Msg {
-	if n < 0 || n >= len(msgtab) {
+func (cfg *Config) msgget(n int) *Msg {
+	if n < 0 || n >= len(cfg.msgtab) {
 		return nil
 	}
-	m := msgtab[n]
+	m := cfg.msgtab[n]
 	if m.ref == 0 {
 		return nil
 	}
@@ -691,12 +689,12 @@ func (q *Queue) recv() *Msg {
 	return p
 }
 
-func mread9p(r io.Reader) (*Msg, error) {
+func (cfg *Config) mread9p(r io.Reader) (*Msg, error) {
 	f, err := plan9.ReadFcall(r)
 	if err != nil {
 		return nil, err
 	}
-	m := msgnew()
+	m := cfg.msgnew()
 	m.tx = *f
 	return m, nil
 }
