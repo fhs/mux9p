@@ -41,6 +41,9 @@ type Config struct {
 	outq      *Queue // Msg queue
 	msize     uint32
 	versioned bool
+
+	fidtab  []*Fid
+	freefid *Fid
 }
 
 const MAXMSG = 64 // per connection
@@ -128,12 +131,13 @@ func (cfg *Config) mainproc(ln net.Listener) {
 	vprintf("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
-	f := new(plan9.Fcall)
 	if !cfg.versioned {
-		f.Type = plan9.Tversion
-		f.Version = "9P2000"
-		f.Msize = cfg.msize
-		f.Tag = plan9.NOTAG
+		f := &plan9.Fcall{
+			Type:    plan9.Tversion,
+			Version: "9P2000",
+			Msize:   cfg.msize,
+			Tag:     plan9.NOTAG,
+		}
 		vbuf, err := f.Bytes()
 		if err != nil {
 			log.Fatalf("Fcall conversion to bytes failed: %v", err)
@@ -176,7 +180,7 @@ func (cfg *Config) listenthread(ln net.Listener) {
 		c.fid = make(map[uint32]*Fid)
 		vprintf("incoming call on %v\n", c.conn.LocalAddr())
 		go cfg.conninthread(&c)
-		go connoutthread(&c)
+		go cfg.connoutthread(&c)
 	}
 }
 
@@ -249,7 +253,7 @@ func (cfg *Config) conninthread(c *Conn) {
 			if m.afid != nil {
 				m.afid.ref++
 			}
-			m.fid = fidnew(m.tx.Fid)
+			m.fid = cfg.fidnew(m.tx.Fid)
 			if _, ok := c.fid[m.tx.Fid]; ok {
 				send9pError(m, "duplicate fid")
 				continue
@@ -269,7 +273,7 @@ func (cfg *Config) conninthread(c *Conn) {
 				m.fid.ref++
 				m.newfid = m.fid
 			} else {
-				m.newfid = fidnew(m.tx.Newfid)
+				m.newfid = cfg.fidnew(m.tx.Newfid)
 				if _, ok := c.fid[m.tx.Newfid]; ok {
 					send9pError(m, "duplicate fid")
 					continue
@@ -283,7 +287,7 @@ func (cfg *Config) conninthread(c *Conn) {
 				send9pError(m, "authentication rejected")
 				continue
 			}
-			m.afid = fidnew(m.tx.Afid)
+			m.afid = cfg.fidnew(m.tx.Afid)
 			if _, ok := c.fid[m.tx.Afid]; ok {
 				send9pError(m, "duplicate fid")
 				continue
@@ -347,12 +351,12 @@ func (cfg *Config) conninthread(c *Conn) {
 		cfg.sendomsg(m)
 		mm := <-c.internal
 		assert(mm == m)
-		msgput(m) // got from chan
-		msgput(m) // got from msgnew
+		cfg.msgput(m) // got from chan
+		cfg.msgput(m) // got from msgnew
 		if deleteTag(c.tag, om.ctag, om) {
-			msgput(om) // got from hash table
+			cfg.msgput(om) // got from hash table
 		}
-		msgput(om) // got from msgincref
+		cfg.msgput(om) // got from msgincref
 	}
 
 	//
@@ -389,10 +393,10 @@ func (cfg *Config) conninthread(c *Conn) {
 		cfg.sendomsg(m)
 		mm := <-c.internal
 		assert(mm == m)
-		msgclear(m)
-		msgput(m) // got from chan
-		msgput(m) // got from msgnew
-		fidput(f) // got from hash table
+		cfg.msgclear(m)
+		cfg.msgput(m) // got from chan
+		cfg.msgput(m) // got from msgnew
+		cfg.fidput(f) // got from hash table
 	}
 
 	assert(c.nmsg == 0)
@@ -401,7 +405,7 @@ func (cfg *Config) conninthread(c *Conn) {
 	close(c.inc)
 }
 
-func connoutthread(c *Conn) {
+func (cfg *Config) connoutthread(c *Conn) {
 	for {
 		m := c.outq.recv()
 		if m == nil {
@@ -413,14 +417,14 @@ func connoutthread(c *Conn) {
 			om := m.oldm
 			if om != nil {
 				if deleteTag(om.c.tag, om.ctag, om) {
-					msgput(om)
+					cfg.msgput(om)
 				}
 			}
 
 		case plan9.Tclunk, plan9.Tremove:
 			if m.fid != nil {
 				if deleteFid(m.c.fid, m.fid.cfid, m.fid) {
-					fidput(m.fid)
+					cfg.fidput(m.fid)
 				}
 			}
 
@@ -428,14 +432,14 @@ func connoutthread(c *Conn) {
 			if badType && m.afid != nil {
 				vprintf("auth error\n")
 				if deleteFid(m.c.fid, m.afid.cfid, m.afid) {
-					fidput(m.afid)
+					cfg.fidput(m.afid)
 				}
 			}
 
 		case plan9.Tattach:
 			if badType && m.fid != nil {
 				if deleteFid(m.c.fid, m.fid.cfid, m.fid) {
-					fidput(m.fid)
+					cfg.fidput(m.fid)
 				}
 			}
 
@@ -443,7 +447,7 @@ func connoutthread(c *Conn) {
 			if badType || len(m.rx.Wqid) < len(m.tx.Wname) {
 				if m.tx.Fid != m.tx.Newfid && m.newfid != nil {
 					if deleteFid(m.c.fid, m.newfid.cfid, m.newfid) {
-						fidput(m.newfid)
+						cfg.fidput(m.newfid)
 					}
 				}
 			}
@@ -454,7 +458,7 @@ func connoutthread(c *Conn) {
 		case plan9.Tcreate:
 		}
 		if deleteTag(m.c.tag, m.ctag, m) {
-			msgput(m)
+			cfg.msgput(m)
 		}
 		vvprintf("fd#%d <- %v\n", c.conn, &m.rx)
 		rpkt, err := m.rx.Bytes()
@@ -464,7 +468,7 @@ func connoutthread(c *Conn) {
 		if _, err := c.conn.Write(rpkt); err != nil {
 			vprintf("write error: %v\n", err)
 		}
-		msgput(m)
+		cfg.msgput(m)
 		if c.inputstalled && c.nmsg < MAXMSG {
 			c.inc <- struct{}{}
 		}
@@ -491,7 +495,7 @@ func (cfg *Config) outputthread() {
 		if _, err := cfg.Writer.Write(tpkt); err != nil {
 			log.Fatalf("output error: %s\n", err)
 		}
-		msgput(m)
+		cfg.msgput(m)
 	}
 	log.Printf("output eof\n")
 	os.Exit(0)
@@ -521,32 +525,27 @@ func (cfg *Config) inputthread() {
 		} else if m.c.outq != nil {
 			m.c.outq.send(m)
 		} else {
-			msgput(m)
+			cfg.msgput(m)
 		}
 	}
 	os.Exit(0)
 }
 
-var (
-	fidtab  []*Fid
-	freefid *Fid
-)
-
-func fidnew(cfid uint32) *Fid {
-	if freefid == nil {
-		freefid = &Fid{
-			fid: uint32(len(fidtab)),
+func (cfg *Config) fidnew(cfid uint32) *Fid {
+	if cfg.freefid == nil {
+		cfg.freefid = &Fid{
+			fid: uint32(len(cfg.fidtab)),
 		}
-		fidtab = append(fidtab, freefid)
+		cfg.fidtab = append(cfg.fidtab, cfg.freefid)
 	}
-	f := freefid
-	freefid = f.next
+	f := cfg.freefid
+	cfg.freefid = f.next
 	f.cfid = cfid
 	f.ref = 1
 	return f
 }
 
-func fidput(f *Fid) {
+func (cfg *Config) fidput(f *Fid) {
 	if f == nil {
 		return
 	}
@@ -555,9 +554,9 @@ func fidput(f *Fid) {
 	if f.ref > 0 {
 		return
 	}
-	f.next = freefid
+	f.next = cfg.freefid
 	f.cfid = ^uint32(0)
-	freefid = f
+	cfg.freefid = f
 }
 
 var (
@@ -591,30 +590,30 @@ func msgnew() *Msg {
 // if all msgs have been msgcleared, the connection can be freed.
 // The io write thread might still be holding a ref to msg
 // even once the connection has finished with it.
-func msgclear(m *Msg) {
+func (cfg *Config) msgclear(m *Msg) {
 	if m.c != nil {
 		m.c.nmsg--
 		m.c = nil
 	}
 	if m.oldm != nil {
-		msgput(m.oldm)
+		cfg.msgput(m.oldm)
 		m.oldm = nil
 	}
 	if m.fid != nil {
-		fidput(m.fid)
+		cfg.fidput(m.fid)
 		m.fid = nil
 	}
 	if m.afid != nil {
-		fidput(m.afid)
+		cfg.fidput(m.afid)
 		m.afid = nil
 	}
 	if m.newfid != nil {
-		fidput(m.newfid)
+		cfg.fidput(m.newfid)
 		m.newfid = nil
 	}
 }
 
-func msgput(m *Msg) {
+func (cfg *Config) msgput(m *Msg) {
 	if m == nil {
 		return
 	}
@@ -626,7 +625,7 @@ func msgput(m *Msg) {
 		return
 	}
 	nmsg--
-	msgclear(m)
+	cfg.msgclear(m)
 	m.internal = false
 	m.next = freemsg
 	freemsg = m
