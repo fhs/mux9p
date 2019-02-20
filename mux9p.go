@@ -1,4 +1,4 @@
-// Package mux9p implements a multiplexer a 9P service.
+// Package mux9p implements a multiplexer for a 9P service.
 //
 // It is a port of Plan 9 Port's 9pserve program
 // (https://9fans.github.io/plan9port/man/man4/9pserve.html)
@@ -31,6 +31,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 
 	"9fans.net/go/plan9"
 )
@@ -102,6 +103,17 @@ type conn struct {
 // accepts 9P clients from it and mutiplexes them into 9P server srv.
 func Listen(network, address string, srv io.ReadWriter, cfg *Config) error {
 	ln, err := net.Listen(network, address)
+	if err != nil && network == "unix" && isAddrInUse(err) {
+		if _, err1 := net.Dial(network, address); !isConnRefused(err1) {
+			return err // Listen error
+		}
+		// Dead socket, so remove it.
+		err = os.Remove(address)
+		if err != nil {
+			return err
+		}
+		ln, err = net.Listen(network, address)
+	}
 	if err != nil {
 		return err
 	}
@@ -754,6 +766,24 @@ func (cfg *Config) deleteFid(tab map[uint32]*fid, fid uint32, f *fid) bool {
 		}
 		delete(tab, fid)
 		return true
+	}
+	return false
+}
+
+func isAddrInUse(err error) bool {
+	if err, ok := err.(*net.OpError); ok {
+		if err, ok := err.Err.(*os.SyscallError); ok {
+			return err.Err == syscall.EADDRINUSE
+		}
+	}
+	return false
+}
+
+func isConnRefused(err error) bool {
+	if err, ok := err.(*net.OpError); ok {
+		if err, ok := err.Err.(*os.SyscallError); ok {
+			return err.Err == syscall.ECONNREFUSED
+		}
 	}
 	return false
 }
