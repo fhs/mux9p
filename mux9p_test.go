@@ -52,8 +52,8 @@ var testLog = []fcallMsg{
 }
 
 func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter) {
-	srvTag := make(map[uint16]uint16, 0)
-	srvFid := make(map[uint32]uint32, 0)
+	srvTag := make(map[uint16]uint16)
+	srvFid := make(map[uint32]uint32)
 
 	for _, m := range l {
 		var (
