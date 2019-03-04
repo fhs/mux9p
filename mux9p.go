@@ -60,6 +60,8 @@ type Config struct {
 	msgtab  []*msg
 	nmsg    int
 	freemsg *msg
+
+	mu sync.Mutex
 }
 
 const maxMsgPerConn = 64
@@ -589,6 +591,9 @@ func (cfg *Config) msgincref(m *msg) {
 }
 
 func (cfg *Config) msgnew() *msg {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
 	if cfg.freemsg == nil {
 		cfg.freemsg = &msg{
 			tag: uint16(len(cfg.msgtab)),
@@ -634,6 +639,9 @@ func (cfg *Config) msgput(m *msg) {
 	if m == nil {
 		return
 	}
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
 	cfg.log2("msgput %p tag %d/%d ref %d\n",
 		m, m.tag, m.ctag, m.ref)
 	assert(m.ref > 0)
@@ -649,6 +657,9 @@ func (cfg *Config) msgput(m *msg) {
 }
 
 func (cfg *Config) msgget(n int) *msg {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
 	if n < 0 || n >= len(cfg.msgtab) {
 		return nil
 	}
