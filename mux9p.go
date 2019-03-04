@@ -517,7 +517,9 @@ func (cfg *Config) outputthread() {
 		cfg.msgput(m)
 	}
 	log.Printf("output eof\n")
-	os.Exit(0)
+	// TODO(fhs): The C code exited the program here.
+	// Since we will not exit, do we need to clean up things instead?
+	//os.Exit(0)
 }
 
 func (cfg *Config) inputthread() {
@@ -547,7 +549,9 @@ func (cfg *Config) inputthread() {
 			cfg.msgput(m)
 		}
 	}
-	os.Exit(0)
+	// TODO(fhs): The C code exited the program here.
+	// Since we will not exit, do we need to clean up things instead?
+	//os.Exit(0)
 }
 
 func (cfg *Config) fidnew(cfid uint32) *fid {
