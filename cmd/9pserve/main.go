@@ -59,5 +59,5 @@ func parseAddr(dial string) (net, addr string) {
 
 type stdio struct{}
 
-func (s stdio) Read(b []byte) (int, error)  { return s.Read(b) }
-func (s stdio) Write(b []byte) (int, error) { return s.Write(b) }
+func (s stdio) Read(b []byte) (int, error)  { return os.Stdin.Read(b) }
+func (s stdio) Write(b []byte) (int, error) { return os.Stdout.Write(b) }

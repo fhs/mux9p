@@ -8,18 +8,18 @@ package mux9p
 
 // Life cycle of a 9P message:
 //
-// 1. conninthread:
+// 1. readFromClient:
 //		read from conn into msg.tx
 //		write global tags and fids to msg.tx
 //		send msg to Config.outq
-// 2. outputthread:
+// 2. writeToServer:
 //		receive from Config.outq
 //		write msg.tx to Config.srv
-// 3. inputthread:
+// 3. readFromServer:
 //		read from Config.srv into msg.rx
 //		write conn's tag to msg.rx
 //		send msg to conn.outq
-// 4. connoutthread:
+// 4. writeToClient:
 //		receive from conn.outq
 //		write msg.rx to conn
 
@@ -49,15 +49,15 @@ type Config struct {
 	// It can be overridden with environment variable verbose9pserve.
 	LogLevel int
 
-	srv       io.ReadWriter
-	outq      *queue // msg queue
-	msize     uint32
-	versioned bool
+	srv       io.ReadWriter // 9P server
+	outq      *queue        // msg queued for write to 9P server
+	msize     uint32        // 9P message size
+	versioned bool          // Do not initialize the connection with a Tversion
 
-	fidtab  []*fid
+	fidtab  []*fid // global fids
 	freefid *fid
 
-	msgtab  []*msg
+	msgtab  []*msg // msg indexed by global tag
 	nmsg    int
 	freemsg *msg
 
@@ -76,7 +76,7 @@ type fid struct {
 type msg struct {
 	c        *conn
 	internal bool        // Tflush or Tclunk used for clean up
-	sync     bool        // used to signal outputthread we're done
+	sync     bool        // used to signal writeToServer we're done
 	ctag     uint16      // Conn's tag
 	tag      uint16      // unique tag over all Conns
 	tx       plan9.Fcall // transmit
@@ -97,7 +97,7 @@ type conn struct {
 	inputstalled bool            // too many messages being processed
 	tag          map[uint16]*msg // conn tag → global tag
 	fid          map[uint32]*fid // conn fid → global fid
-	outq         *queue          // msg queue
+	outq         *queue          // msg queued for write to 9P client
 	outqdead     chan struct{}   // done using outq or Conn.outq
 }
 
@@ -178,8 +178,8 @@ func (cfg *Config) mainproc(ln net.Listener) error {
 		cfg.log2("* -> %v\n", f)
 	}
 
-	go cfg.inputthread()
-	go cfg.outputthread()
+	go cfg.readFromServer()
+	go cfg.writeToServer()
 
 	return cfg.listenthread(ln)
 }
@@ -200,8 +200,8 @@ func (cfg *Config) listenthread(ln net.Listener) error {
 		c.tag = make(map[uint16]*msg)
 		c.fid = make(map[uint32]*fid)
 		cfg.log("incoming call on %v\n", c.conn.LocalAddr())
-		go cfg.conninthread(&c)
-		go cfg.connoutthread(&c)
+		go cfg.readFromClient(&c)
+		go cfg.writeToClient(&c)
 	}
 }
 
@@ -220,7 +220,7 @@ func send9pError(m *msg, ename string) {
 	send9pmsg(m)
 }
 
-func (cfg *Config) conninthread(c *conn) {
+func (cfg *Config) readFromClient(c *conn) {
 	var ok bool
 
 	for {
@@ -381,7 +381,7 @@ func (cfg *Config) conninthread(c *conn) {
 	}
 
 	//
-	// outputthread has written all its messages
+	// writeToServer has written all its messages
 	// to the remote connection (because we've gotten all the replies!),
 	// but it might not have gotten a chance to msgput
 	// the very last one.  sync up to make sure.
@@ -426,7 +426,7 @@ func (cfg *Config) conninthread(c *conn) {
 	close(c.inc)
 }
 
-func (cfg *Config) connoutthread(c *conn) {
+func (cfg *Config) writeToClient(c *conn) {
 	for {
 		m := c.outq.recv()
 		if m == nil {
@@ -498,7 +498,7 @@ func (cfg *Config) connoutthread(c *conn) {
 	c.outqdead <- struct{}{}
 }
 
-func (cfg *Config) outputthread() {
+func (cfg *Config) writeToServer() {
 	for {
 		m := cfg.outq.recv()
 		if m == nil {
@@ -524,7 +524,7 @@ func (cfg *Config) outputthread() {
 	//os.Exit(0)
 }
 
-func (cfg *Config) inputthread() {
+func (cfg *Config) readFromServer() {
 	cfg.log("input thread\n")
 
 	for {

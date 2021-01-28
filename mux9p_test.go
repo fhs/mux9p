@@ -34,21 +34,21 @@ var versionLog = []fcallMsg{
 
 var testLog = []fcallMsg{
 	// These message are responded by the mux. They never go to the server.
-	{CW, plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
-	{CR, plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
+	{kind: CW, f: plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
+	{kind: CR, f: plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
 
-	{CW, plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
-	{SR, plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
-	{SW, plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
-	{CR, plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
-	{CW, plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
-	{SR, plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
-	{SW, plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{0, 0, plan9.QTDIR}}},
-	{CR, plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{0, 0, plan9.QTDIR}}},
-	{CW, plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
-	{SR, plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
-	{SW, plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
-	{CR, plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
+	{kind: CW, f: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
+	{kind: SR, f: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
+	{kind: SW, f: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
+	{kind: CR, f: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
+	{kind: CW, f: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
+	{kind: SR, f: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
+	{kind: SW, f: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}},
+	{kind: CR, f: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}},
+	{kind: CW, f: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
+	{kind: SR, f: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
+	{kind: SW, f: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
+	{kind: CR, f: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
 }
 
 func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter) {
