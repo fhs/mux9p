@@ -1,6 +1,7 @@
 package mux9p
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -12,43 +13,77 @@ import (
 	"time"
 
 	"9fans.net/go/plan9"
+	"github.com/fhs/mux9p/internal/p9p"
 )
+
+type Kind int
 
 const (
-	SR = iota // server read
-	SW        // server write
-	CR        // client read
-	CW        // client write
+	SR Kind = iota // server read
+	SW             // server write
+	CR             // client read
+	CW             // client write
 )
 
+func (k Kind) String() string {
+	switch k {
+	case SR:
+		return "SR"
+	case SW:
+		return "SW"
+	case CR:
+		return "CR"
+	case CW:
+		return "CW"
+	}
+	return fmt.Sprintf("Kind(%d)", int(k))
+}
+
 type fcallMsg struct {
-	kind int
-	f    plan9.Fcall
+	kind Kind
+	f    p9p.Fcall
 }
 
 var versionLog = []fcallMsg{
 	// The mutiplexer is itself a client for these.
-	{SR, plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
-	{SW, plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}}},
 }
 
 var testLog = []fcallMsg{
 	// These message are responded by the mux. They never go to the server.
-	{kind: CW, f: plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
-	{kind: CR, f: plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}},
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tversion, Tag: 65535, Msize: 8092, Version: "9P2000"}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rversion, Tag: 65535, Msize: 8092, Version: "9P2000"}}},
 
-	{kind: CW, f: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
-	{kind: SR, f: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}},
-	{kind: SW, f: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
-	{kind: CR, f: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}},
-	{kind: CW, f: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
-	{kind: SR, f: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}},
-	{kind: SW, f: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}},
-	{kind: CR, f: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}},
-	{kind: CW, f: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
-	{kind: SR, f: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}},
-	{kind: SW, f: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
-	{kind: CR, f: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}},
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tauth, Tag: 0, Afid: 0, Uname: "fhs", Aname: ""}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rerror, Tag: 0, Ename: "acme: authentication not required"}}},
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tattach, Tag: 1, Fid: 1, Afid: ^uint32(0), Uname: "fhs", Aname: ""}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rattach, Tag: 1, Qid: plan9.Qid{Path: 0, Vers: 0, Type: plan9.QTDIR}}}},
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Twalk, Tag: 2, Fid: 1, Newfid: 2, Wname: []string{"ctl"}}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Twalk, Tag: 2, Fid: 1, Newfid: 2, Wname: []string{"ctl"}}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rwalk, Tag: 2, Wqid: []plan9.Qid{{Path: 1, Vers: 0, Type: 0}}}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rwalk, Tag: 2, Wqid: []plan9.Qid{{Path: 1, Vers: 0, Type: 0}}}}},
+
+	// Server sees a Topenfd as Topen
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Topenfd, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Topen, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Ropen, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Ropenfd, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}, Unixfd: 3}},
+
+	// mux will read for client for the openfd pipe. Server sends EOF and mux clunks the fid.
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tread, Tag: 2, Fid: 2, Offset: 0, Count: 8068}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rread, Tag: 2, Count: 0, Data: nil}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 2, Fid: 2}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 2}}},
+
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
 }
 
 func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter) {
@@ -56,6 +91,7 @@ func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter)
 	srvFid := make(map[uint32]uint32)
 
 	for _, m := range l {
+		t.Logf("%v: Fcall = %v", m.kind, m.f.String())
 		var (
 			r io.Reader
 			w io.Writer
@@ -71,9 +107,9 @@ func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter)
 			w = cli
 		}
 		if r != nil {
-			f, err := plan9.ReadFcall(r)
+			f, err := p9p.ReadFcall(r)
 			if err != nil {
-				t.Fatalf("ReadFcall failed: %v", err)
+				t.Fatalf("%v: ReadFcall failed: %v", m.kind, err)
 			}
 			if m.kind == SR && m.f.Tag != f.Tag {
 				srvTag[m.f.Tag] = f.Tag
@@ -83,8 +119,19 @@ func replayLog(t *testing.T, l []fcallMsg, srv io.ReadWriter, cli io.ReadWriter)
 				srvFid[m.f.Fid] = f.Fid
 				m.f.Fid = f.Fid // ignore Fid changes
 			}
+			if m.kind == SR && m.f.Newfid != f.Newfid {
+				srvFid[m.f.Newfid] = f.Newfid
+				m.f.Newfid = f.Newfid // ignore Newfid changes
+			}
+			if m.kind == CR && m.f.Type == p9p.Ropenfd {
+				m.f.Unixfd = f.Unixfd // ignore Unixfd
+				_, err := p9p.ReceiveFD(r.(*net.UnixConn))
+				if err != nil {
+					t.Errorf("%v: ReceiveFD: %v", m.kind, err)
+				}
+			}
 			if !reflect.DeepEqual(&m.f, f) {
-				t.Errorf("Fcall mismatch:\nwant: %v\n got: %v", &m.f, f)
+				t.Errorf("%v: Fcall mismatch:\nwant: %v\n got: %v", m.kind, &m.f, f)
 			}
 		}
 		if w != nil {
