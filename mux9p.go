@@ -67,30 +67,35 @@ type Config struct {
 const maxMsgPerConn = 64
 
 type fid struct {
-	fid  uint32
-	cfid uint32 // Conn's fid
-	ref  int    // ref counting for freefid
-	next *fid   // next in freefid
+	fid    uint32
+	cfid   uint32 // Conn's fid
+	openfd int
+	ref    int  // ref counting for freefid
+	next   *fid // next in freefid
 }
 
 type msg struct {
 	c        *conn
-	internal bool        // Tflush or Tclunk used for clean up
-	sync     bool        // used to signal writeToServer we're done
-	ctag     uint16      // Conn's tag
-	tag      uint16      // unique tag over all Conns
-	tx       plan9.Fcall // transmit
-	rx       plan9.Fcall // receive
-	fid      *fid        // Tattach, Twalk, etc.
-	newfid   *fid        // Twalk Newfid
-	afid     *fid        // Tauth Fid
-	oldm     *msg        // msg corresponding to Tflush Oldtag
-	ref      int         // ref counting for freemsg
-	next     *msg        // next in freemsg
+	internal bool   // Tflush or Tclunk used for clean up
+	sync     bool   // used to signal writeToServer we're done
+	ctag     uint16 // Conn's tag
+	tag      uint16 // unique tag over all Conns
+	isopenfd bool   // Topenfd message
+	tx       Fcall  // transmit
+	rx       Fcall  // receive
+	fid      *fid   // Tattach, Twalk, etc.
+	newfid   *fid   // Twalk Newfid
+	afid     *fid   // Tauth Fid
+	oldm     *msg   // msg corresponding to Tflush Oldtag
+	ref      int    // ref counting for freemsg
+	next     *msg   // next in freemsg
 }
 
 type conn struct {
 	conn         net.Conn
+	fd           *os.File
+	fdmode       uint8
+	fdfid        *fid
 	nmsg         int             // number of outstanding messages
 	inc          chan struct{}   // continue if inputstalled
 	internal     chan *msg       // used to send internal msgs
@@ -241,6 +246,10 @@ func (cfg *Config) readFromClient(c *conn) {
 
 		cfg.msgincref(m)
 		switch m.tx.Type {
+		default:
+			cfg.log("unknown fcall type %v", m.tx.Type)
+			panic("???")
+
 		case plan9.Tversion:
 			m.rx.Tag = m.tx.Tag
 			m.rx.Msize = m.tx.Msize
@@ -316,12 +325,27 @@ func (cfg *Config) readFromClient(c *conn) {
 			c.fid[m.tx.Afid] = m.afid
 			m.afid.ref++
 
+		case Topenfd:
+			if m.tx.Mode&^(plan9.OTRUNC|3) != 0 {
+				send9pError(m, "bad openfd mode")
+				continue
+			}
+			m.isopenfd = true
+			m.tx.Type = plan9.Topen
+			m.fid, ok = c.fid[m.tx.Fid]
+			if !ok {
+				send9pError(m, "unknown fid")
+				continue
+			}
+			m.fid.ref++
+
 		case plan9.Tcreate:
 			if m.tx.Perm&(plan9.DMSYMLINK|plan9.DMDEVICE|plan9.DMNAMEDPIPE|plan9.DMSOCKET) != 0 {
 				send9pError(m, "unsupported file type")
 				continue
 			}
 			fallthrough
+
 		case plan9.Topen, plan9.Tclunk, plan9.Tread, plan9.Twrite, plan9.Tremove, plan9.Tstat, plan9.Twstat:
 			m.fid, ok = c.fid[m.tx.Fid]
 			if !ok {
@@ -426,6 +450,156 @@ func (cfg *Config) readFromClient(c *conn) {
 	close(c.inc)
 }
 
+func (cfg *Config) openfdthread(c *conn) {
+	var buf [1024]byte
+
+	fid := c.fdfid
+	tot := uint64(0)
+	var m *msg
+	if c.fdmode == plan9.OREAD {
+		for {
+			cfg.log("tread...")
+			m = cfg.msgnew()
+			m.internal = true
+			m.c = c
+			m.tx.Type = plan9.Tread
+			m.tx.Count = cfg.msize - plan9.IOHDRSZ
+			m.tx.Fid = fid.fid
+			m.tx.Tag = m.tag
+			m.tx.Offset = tot
+			m.fid = fid
+			fid.ref++
+			cfg.msgincref(m)
+			cfg.sendomsg(m)
+			<-c.internal
+			if m.rx.Type == plan9.Rerror {
+				/*	fprint(2, "%T read error: %s\n", m.rx.ename); */
+				break
+			}
+			if m.rx.Count == 0 {
+				break
+			}
+			tot += uint64(m.rx.Count)
+			if _, err := c.fd.Write(m.rx.Data[:m.rx.Count]); err != nil {
+				/* fprint(2, "%T pipe write error: %r\n"); */
+				break
+			}
+			cfg.msgput(m)
+			cfg.msgput(m)
+			m = nil
+		}
+	} else {
+		for {
+			cfg.log("twrite...")
+			n := len(buf)
+			if n > int(cfg.msize) {
+				n = int(cfg.msize)
+			}
+			n, err := c.fd.Read(buf[:n])
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				//fprint(2, "%T pipe read error: %r\n")
+			}
+			m = cfg.msgnew()
+			m.internal = true
+			m.c = c
+			m.tx.Type = plan9.Twrite
+			m.tx.Fid = fid.fid
+			m.tx.Data = buf[:]
+			m.tx.Count = uint32(n)
+			m.tx.Tag = m.tag
+			m.tx.Offset = tot
+			m.fid = fid
+			fid.ref++
+			cfg.msgincref(m)
+			cfg.sendomsg(m)
+			<-c.internal
+			if m.rx.Type == plan9.Rerror {
+				/*	fprint(2, "%T write error: %s\n", m.rx.ename); */
+			}
+			tot += uint64(n)
+			cfg.msgput(m)
+			cfg.msgput(m)
+			m = nil
+		}
+	}
+	cfg.log("eof on %d fid %d\n", c.fd.Fd(), fid.fid)
+	c.fd.Close()
+	if m != nil {
+		cfg.msgput(m)
+		cfg.msgput(m)
+	}
+	cfg.log("eof on %d fid %d ref %d\n", c.fd.Fd(), fid.fid, fid.ref)
+	fid.openfd--
+	if fid.openfd == 0 {
+		m = cfg.msgnew()
+		m.internal = true
+		m.c = c
+		m.tx.Type = plan9.Tclunk
+		m.tx.Tag = m.tag
+		m.tx.Fid = fid.fid
+		m.fid = fid
+		fid.ref++
+		cfg.msgincref(m)
+		cfg.sendomsg(m)
+		<-c.internal
+		cfg.msgput(m)
+		cfg.msgput(m)
+	}
+	cfg.fidput(fid)
+	c.fdfid = nil
+	c.internal = nil
+}
+
+func (cfg *Config) xopenfd(m *msg) int {
+	p0, p1, err := Pipe()
+	if err != nil {
+		send9pError(m, err.Error())
+		/* XXX return here? */
+	}
+	cfg.log("xopen pipe %d %d...", p0.Fd(), p1.Fd())
+
+	// now we're committed.
+
+	// a new connection for this fid
+	nc := new(conn)
+	nc.internal = make(chan *msg)
+
+	/* a ref for us */
+	nc.fdfid = m.fid
+	m.fid.ref++
+	nc.fdfid.openfd++
+	nc.fdmode = m.tx.Mode
+	nc.fd = p0
+
+	// a thread to tend the pipe
+	go cfg.openfdthread(nc)
+
+	// if mode is ORDWR, that openfdthread will write; start a reader
+	if m.tx.Mode&3 == plan9.ORDWR {
+		nc := new(conn)
+		nc.internal = make(chan *msg)
+		nc.fdfid = m.fid
+		m.fid.ref++
+		nc.fdfid.openfd++
+		nc.fdmode = plan9.OREAD
+		//nc.fd = dup(p0, -1) 	how to avoid double close?
+		go cfg.openfdthread(nc)
+	}
+
+	// steal fid from other connection
+	if cfg.deleteFid(m.c.fid, m.fid.cfid, m.fid) {
+		cfg.fidput(m.fid)
+	}
+
+	// rewrite as Ropenfd
+	m.rx.Type = Ropenfd
+	m.rx.Unixfd = uint32(p1.Fd())
+	return 0
+}
+
 func (cfg *Config) writeToClient(c *conn) {
 	for {
 		m := c.outq.recv()
@@ -433,6 +607,11 @@ func (cfg *Config) writeToClient(c *conn) {
 			break
 		}
 		badType := m.tx.Type+1 != m.rx.Type
+		if !badType && m.isopenfd {
+			if cfg.xopenfd(m) < 0 {
+				continue
+			}
+		}
 		switch m.tx.Type {
 		case plan9.Tflush:
 			om := m.oldm
@@ -540,7 +719,7 @@ func (cfg *Config) readFromServer() {
 			log.Printf("unexpected 9P response tag %v\n", f.Tag)
 			continue
 		}
-		m.rx = *f
+		m.rx = Fcall{Fcall: *f}
 		cfg.log2("* -> %v internal=%v\n", &m.rx, m.internal)
 		m.rx.Tag = m.ctag
 		if m.internal {
@@ -651,6 +830,7 @@ func (cfg *Config) msgput(m *msg) {
 	}
 	cfg.nmsg--
 	cfg.msgclear(m)
+	m.isopenfd = false
 	m.internal = false
 	m.next = cfg.freemsg
 	cfg.freemsg = m
@@ -720,7 +900,7 @@ func (q *queue) recv() *msg {
 }
 
 func (cfg *Config) mread9p(r io.Reader) (*msg, error) {
-	f, err := plan9.ReadFcall(r)
+	f, err := ReadFcall(r)
 	if err != nil {
 		return nil, err
 	}
