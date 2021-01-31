@@ -1,0 +1,36 @@
+on: [push, pull_request]
+name: Go Cross-compile
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        go-version: [1.14.x, 1.15.x]
+        platform: [ubuntu-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.platform }}
+    env:
+      GO111MODULE: on
+
+    steps:
+    - name: Install Go
+      uses: actions/setup-go@v1
+      with:
+        go-version: ${{ matrix.go-version }}
+
+    - name: Checkout code
+      uses: actions/checkout@v1
+
+    - name: Cross-compile
+      run: |
+        GOOS=aix GOARCH=ppc64 go build ./...
+        #GOOS=darwin go build ./...  already testing
+        GOOS=dragonfly go build ./...
+        GOOS=freebsd go build ./...
+        #GOOS=linux go build ./... already testing
+        GOOS=netbsd go build ./...
+        GOOS=openbsd go build ./...
+        #GOOS=plan9 go build ./...
+        GOOS=solaris go build ./...
+        GOOS=windows go build ./...
+      shell: bash
