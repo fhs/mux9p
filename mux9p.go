@@ -59,7 +59,6 @@ type Config struct {
 	freefid *fid
 
 	msgtab  []*msg // msg indexed by global tag
-	nmsg    int
 	freemsg *msg
 
 	mu sync.Mutex
@@ -68,11 +67,11 @@ type Config struct {
 const maxMsgPerConn = 64
 
 type fid struct {
-	fid    uint32
+	fid    uint32 // global fid
 	cfid   uint32 // Conn's fid
-	openfd int
-	ref    int  // ref counting for freefid
-	next   *fid // next in freefid
+	openfd int    // Topenfd pipe reference counter
+	ref    int    // ref counting for freefid
+	next   *fid   // next in freefid
 }
 
 type msg struct {
@@ -94,9 +93,9 @@ type msg struct {
 
 type conn struct {
 	conn         net.Conn
-	fd           *os.File
-	fdmode       uint8
-	fdfid        *fid
+	fd           *os.File        // our end of the Topenfd pipe
+	fdmode       uint8           // Topenfd mode: OREAD or OWRITE or ORDWR
+	fdfid        *fid            // fid used in Topenfd
 	nmsg         int             // number of outstanding messages
 	inc          chan struct{}   // continue if inputstalled
 	internal     chan *msg       // used to send internal msgs
@@ -794,7 +793,6 @@ func (cfg *Config) msgnew() *msg {
 	cfg.freemsg = m.next
 	m.ref = 1
 	cfg.log2("msgnew %p tag %d ref %d\n", m, m.tag, m.ref)
-	cfg.nmsg++
 	return m
 }
 
@@ -843,7 +841,6 @@ func (cfg *Config) msgput(m *msg) {
 	if m.ref > 0 {
 		return
 	}
-	cfg.nmsg--
 	cfg.msgclear(m)
 	m.isopenfd = false
 	m.internal = false
