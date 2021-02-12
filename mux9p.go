@@ -50,60 +50,39 @@ type Config struct {
 	// It can be overridden with environment variable verbose9pserve.
 	LogLevel int
 
-	srv       io.ReadWriter // 9P server
-	outq      *queue        // msg queued for write to 9P server
-	msize     uint32        // 9P message size
-	versioned bool          // Do not initialize the connection with a Tversion
+	msize     uint32 // 9P message size
+	versioned bool   // Do not initialize the connection with a Tversion
+
+	outc chan *msg
 
 	fidtab  []*fid // global fids
-	freefid *fid
-
+	freefid []*fid
 	msgtab  []*msg // msg indexed by global tag
-	freemsg *msg
-
-	mu sync.Mutex
+	freemsg []*msg
+	mu      sync.Mutex
 }
 
-const maxMsgPerConn = 64
-
 type fid struct {
-	fid    uint32 // global fid
-	cfid   uint32 // Conn's fid
-	openfd int    // Topenfd pipe reference counter
-	ref    int    // ref counting for freefid
-	next   *fid   // next in freefid
+	fid  uint32 // global fid
+	cfid uint32 // Conn's fid
 }
 
 type msg struct {
-	c        *conn
-	internal bool      // Tflush or Tclunk used for clean up
-	sync     bool      // used to signal writeToServer we're done
-	ctag     uint16    // Conn's tag
-	tag      uint16    // unique tag over all Conns
-	isopenfd bool      // Topenfd message
-	tx       p9p.Fcall // transmit
-	rx       p9p.Fcall // receive
-	fid      *fid      // Tattach, Twalk, etc.
-	newfid   *fid      // Twalk Newfid
-	afid     *fid      // Tauth Fid
-	oldm     *msg      // msg corresponding to Tflush Oldtag
-	ref      int       // ref counting for freemsg
-	next     *msg      // next in freemsg
+	tx, rx *p9p.Fcall
+	ctag   uint16 // Conn's tag
+	tag    uint16 // unique tag over all Conns
+	outc   chan *msg
+	fid    *fid // Tattach, Twalk, etc.
+	newfid *fid // Twalk Newfid
+	afid   *fid // Tauth Fid
+	oldm   *msg // msg corresponding to Tflush Oldtag
 }
 
-type conn struct {
-	conn         net.Conn
-	fd           *os.File        // our end of the Topenfd pipe
-	fdmode       uint8           // Topenfd mode: OREAD or OWRITE or ORDWR
-	fdfid        *fid            // fid used in Topenfd
-	nmsg         int             // number of outstanding messages
-	inc          chan struct{}   // continue if inputstalled
-	internal     chan *msg       // used to send internal msgs
-	inputstalled bool            // too many messages being processed
-	tag          map[uint16]*msg // conn tag → global tag
-	fid          map[uint32]*fid // conn fid → global fid
-	outq         *queue          // msg queued for write to 9P client
-	outqdead     chan struct{}   // done using outq or Conn.outq
+type client struct {
+	tag  map[uint16]*msg // conn tag → global tag
+	fid  map[uint32]*fid // conn fid → global fid
+	outc chan *msg       // msg queued for write to 9P client
+	cfg  *Config
 }
 
 // Listen creates a listener at the given network and address,
@@ -144,13 +123,11 @@ func Do(ln net.Listener, srv io.ReadWriter, cfg *Config) error {
 			fmt.Fprintf(os.Stderr, "verbose9pserve %s => %d\n", x, cfg.LogLevel)
 		}
 	}
-	cfg.srv = srv
-	cfg.outq = newQueue()
 	cfg.msize = 8092
-	return cfg.mainproc(ln)
+	return cfg.mainproc(srv, ln)
 }
 
-func (cfg *Config) mainproc(ln net.Listener) error {
+func (cfg *Config) mainproc(srv io.ReadWriter, ln net.Listener) error {
 	cfg.log("9pserve running\n")
 	//atnotify(ignorepipe, 1)
 
@@ -166,13 +143,13 @@ func (cfg *Config) mainproc(ln net.Listener) error {
 			cfg.log("Fcall conversion to bytes failed: %v", err)
 			return err
 		}
-		cfg.log2("* <- %v\n", f)
-		_, err = cfg.srv.Write(vbuf)
+		cfg.log2("init: * <- %v\n", f)
+		_, err = srv.Write(vbuf)
 		if err != nil {
 			cfg.log("error writing Tversion: %v", err)
 			return err
 		}
-		f, err = plan9.ReadFcall(cfg.srv)
+		f, err = plan9.ReadFcall(srv)
 		if err != nil {
 			cfg.log("ReadFcall failed: %v", err)
 			return err
@@ -180,544 +157,338 @@ func (cfg *Config) mainproc(ln net.Listener) error {
 		if f.Msize < cfg.msize {
 			cfg.msize = f.Msize
 		}
-		cfg.log2("* -> %v\n", f)
+		cfg.log2("init: * -> %v\n", f)
 	}
 
-	go cfg.readFromServer()
-	go cfg.writeToServer()
+	cfg.outc = make(chan *msg)
+	go cfg.readFromServer(srv)
+	go cfg.writeToServer(srv)
 
 	return cfg.listenthread(ln)
 }
 
 func (cfg *Config) listenthread(ln net.Listener) error {
 	for {
-		var c conn
-		var err error
-		c.conn, err = ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			cfg.log("listen: %v\n", err)
 			return err
 		}
-		c.inc = make(chan struct{})
-		c.internal = make(chan *msg)
-		c.outq = newQueue()
-		c.outqdead = make(chan struct{})
-		c.tag = make(map[uint16]*msg)
-		c.fid = make(map[uint32]*fid)
-		cfg.log("incoming call on %v\n", c.conn.LocalAddr())
-		go cfg.readFromClient(&c)
-		go cfg.writeToClient(&c)
+		cfg.log("incoming call on %v\n", conn.LocalAddr())
+		go cfg.clientIO(conn)
 	}
 }
 
-func send9pmsg(m *msg) {
-	m.c.outq.send(m)
-}
-
-func (cfg *Config) sendomsg(m *msg) {
-	cfg.outq.send(m)
-}
-
-func send9pError(m *msg, ename string) {
-	m.rx.Type = plan9.Rerror
-	m.rx.Ename = ename
-	m.rx.Tag = m.tx.Tag
-	send9pmsg(m)
-}
-
-func (cfg *Config) readFromClient(c *conn) {
-	var ok bool
-
-	for {
-		m, err := cfg.mread9p(c.conn)
-		if err != nil {
-			break
-		}
-		cfg.log2("fd#%v -> %v\n", c.conn.RemoteAddr(), &m.tx)
-		m.c = c
-		m.ctag = m.tx.Tag
-		c.nmsg++
-		cfg.log2("fd#%v: new msg %p\n", c.conn.RemoteAddr(), m)
-		if _, ok := c.tag[m.tx.Tag]; ok {
-			send9pError(m, "duplicate tag")
-			continue
-		}
-		c.tag[m.tx.Tag] = m
-
-		cfg.msgincref(m)
-		switch m.tx.Type {
-		default:
-			cfg.log("unknown fcall type %v", m.tx.Type)
-
-		case plan9.Tversion:
-			m.rx.Tag = m.tx.Tag
-			m.rx.Msize = m.tx.Msize
-			if m.rx.Msize > cfg.msize {
-				m.rx.Msize = cfg.msize
-			}
-			m.rx.Version = "9P2000"
-			m.rx.Type = plan9.Rversion
-			send9pmsg(m)
-			continue
-
-		case plan9.Tflush:
-			m.oldm, ok = c.tag[m.tx.Oldtag]
-			if !ok {
-				m.rx.Tag = m.tx.Tag
-				m.rx.Type = plan9.Rflush
-				send9pmsg(m)
-				continue
-			}
-			cfg.msgincref(m.oldm)
-
-		case plan9.Tattach:
-			m.afid = nil
-			if m.tx.Afid != plan9.NOFID {
-				m.afid, ok = c.fid[m.tx.Afid]
-				if !ok {
-					send9pError(m, "unknown fid")
-					continue
-				}
-			}
-			if m.afid != nil {
-				m.afid.ref++
-			}
-			m.fid = cfg.fidnew(m.tx.Fid)
-			if _, ok := c.fid[m.tx.Fid]; ok {
-				send9pError(m, "duplicate fid")
-				continue
-			}
-			c.fid[m.tx.Fid] = m.fid
-
-			m.fid.ref++
-
-		case plan9.Twalk:
-			m.fid, ok = c.fid[m.tx.Fid]
-			if !ok {
-				send9pError(m, "unknown fid")
-				continue
-			}
-			m.fid.ref++
-			if m.tx.Newfid == m.tx.Fid {
-				m.fid.ref++
-				m.newfid = m.fid
-			} else {
-				m.newfid = cfg.fidnew(m.tx.Newfid)
-				if _, ok := c.fid[m.tx.Newfid]; ok {
-					send9pError(m, "duplicate fid")
-					continue
-				}
-				c.fid[m.tx.Newfid] = m.newfid
-				m.newfid.ref++
-			}
-
-		case plan9.Tauth:
-			if cfg.NoAuth {
-				send9pError(m, "authentication rejected")
-				continue
-			}
-			m.afid = cfg.fidnew(m.tx.Afid)
-			if _, ok := c.fid[m.tx.Afid]; ok {
-				send9pError(m, "duplicate fid")
-				continue
-			}
-			c.fid[m.tx.Afid] = m.afid
-			m.afid.ref++
-
-		case p9p.Topenfd:
-			if _, ok := c.conn.(*net.UnixConn); !ok {
-				send9pError(m, "only supported on unix socket")
-				continue
-			}
-			if m.tx.Mode&^(plan9.OTRUNC|3) != 0 {
-				send9pError(m, "bad openfd mode")
-				continue
-			}
-			m.isopenfd = true
-			m.tx.Type = plan9.Topen
-			m.fid, ok = c.fid[m.tx.Fid]
-			if !ok {
-				send9pError(m, "unknown fid")
-				continue
-			}
-			m.fid.ref++
-
-		case plan9.Tcreate:
-			if m.tx.Perm&(plan9.DMSYMLINK|plan9.DMDEVICE|plan9.DMNAMEDPIPE|plan9.DMSOCKET) != 0 {
-				send9pError(m, "unsupported file type")
-				continue
-			}
-			fallthrough
-		case plan9.Topen, plan9.Tclunk, plan9.Tread, plan9.Twrite, plan9.Tremove, plan9.Tstat, plan9.Twstat:
-			m.fid, ok = c.fid[m.tx.Fid]
-			if !ok {
-				send9pError(m, "unknown fid")
-				continue
-			}
-			m.fid.ref++
-		}
-
-		// have everything - translate and send
-		m.c = c
-		m.ctag = m.tx.Tag
-		m.tx.Tag = m.tag
-		if m.fid != nil {
-			m.tx.Fid = m.fid.fid
-		}
-		if m.newfid != nil {
-			m.tx.Newfid = m.newfid.fid
-		}
-		if m.afid != nil {
-			m.tx.Afid = m.afid.fid
-		}
-		if m.oldm != nil {
-			m.tx.Oldtag = m.oldm.tag
-		}
-		// reference passes to outq
-		cfg.outq.send(m)
-		for c.nmsg >= maxMsgPerConn {
-			c.inputstalled = true
-			<-c.inc
-		}
-	}
-	cfg.log("fd#%v eof; flushing conn\n", c.conn.RemoteAddr())
-
-	// flush all outstanding messages
-	for _, om := range c.tag {
-		cfg.msgincref(om) // for us
-		m := cfg.msgnew()
-		m.internal = true
-		m.c = c
-		c.nmsg++
-		m.tx.Type = plan9.Tflush
-		m.tx.Tag = m.tag
-		m.tx.Oldtag = om.tag
-		m.oldm = om
-		cfg.msgincref(om)
-		cfg.msgincref(m) // for outq
-		cfg.sendomsg(m)
-		mm := <-c.internal
-		assert(mm == m)
-		cfg.msgput(m) // got from chan
-		cfg.msgput(m) // got from msgnew
-		if cfg.deleteTag(c.tag, om.ctag, om) {
-			cfg.msgput(om) // got from hash table
-		}
-		cfg.msgput(om) // got from msgincref
-	}
-
-	//
-	// writeToServer has written all its messages
-	// to the remote connection (because we've gotten all the replies!),
-	// but it might not have gotten a chance to msgput
-	// the very last one.  sync up to make sure.
-	//
-	cfg.outq.send(&msg{
-		sync: true,
-		c:    c,
-	})
-	<-c.outqdead
-
-	// everything is quiet; can close the local output queue.
-	c.outq.send(nil)
-	<-c.outqdead
-
-	// should be no messages left anywhere.
-	assert(c.nmsg == 0)
-
-	// clunk all outstanding fids
-	for _, f := range c.fid {
-		m := cfg.msgnew()
-		m.internal = true
-		m.c = c
-		c.nmsg++
-		m.tx.Type = plan9.Tclunk
-		m.tx.Tag = m.tag
-		m.tx.Fid = f.fid
-		m.fid = f
-		f.ref++
-		cfg.msgincref(m)
-		cfg.sendomsg(m)
-		mm := <-c.internal
-		assert(mm == m)
-		cfg.msgclear(m)
-		cfg.msgput(m) // got from chan
-		cfg.msgput(m) // got from msgnew
-		cfg.fidput(f) // got from hash table
-	}
-
-	assert(c.nmsg == 0)
-	c.conn.Close()
-	close(c.internal)
-	close(c.inc)
-}
-
-func (cfg *Config) openfdthread(c *conn) {
-	var buf [1024]byte
-
-	fid := c.fdfid
-	tot := uint64(0)
-	var m *msg
-	if c.fdmode == plan9.OREAD {
+func (cfg *Config) clientIO(conn net.Conn) {
+	readc := make(chan *p9p.Fcall)
+	go func() {
 		for {
-			cfg.log("tread...")
-			m = cfg.msgnew()
-			m.internal = true
-			m.c = c
-			m.tx.Type = plan9.Tread
-			m.tx.Count = cfg.msize - plan9.IOHDRSZ
-			m.tx.Fid = fid.fid
-			m.tx.Tag = m.tag
-			m.tx.Offset = tot
-			m.fid = fid
-			fid.ref++
-			cfg.msgincref(m)
-			cfg.sendomsg(m)
-			<-c.internal
-			if m.rx.Type == plan9.Rerror {
-				cfg.log("read error: %s\n", m.rx.Ename)
-				break
-			}
-			if m.rx.Count == 0 {
-				break
-			}
-			tot += uint64(m.rx.Count)
-			if _, err := c.fd.Write(m.rx.Data[:m.rx.Count]); err != nil {
-				cfg.log("pipe write error: %v\n", err)
-				break
-			}
-			cfg.msgput(m)
-			cfg.msgput(m)
-			m = nil
-		}
-	} else {
-		for {
-			cfg.log("twrite...")
-			n := len(buf)
-			if n > int(cfg.msize) {
-				n = int(cfg.msize)
-			}
-			cfg.log("openfd reading %v bytes...", n)
-			n, err := c.fd.Read(buf[:n])
+			f, err := p9p.ReadFcall(conn)
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
-				cfg.log("pipe read error: %v\n", err)
+				log.Printf("ReadFcall failed: %v", err)
+				break
 			}
-			cfg.log("openfd read: %v", string(buf[:n]))
-			m = cfg.msgnew()
-			m.internal = true
-			m.c = c
-			m.tx.Type = plan9.Twrite
-			m.tx.Fid = fid.fid
-			m.tx.Data = buf[:]
-			m.tx.Count = uint32(n)
-			m.tx.Tag = m.tag
-			m.tx.Offset = tot
-			m.fid = fid
-			fid.ref++
-			cfg.msgincref(m)
-			cfg.sendomsg(m)
-			<-c.internal
-			if m.rx.Type == plan9.Rerror {
-				cfg.log("write error: %s\n", m.rx.Ename)
-			}
-			tot += uint64(n)
-			cfg.msgput(m)
-			cfg.msgput(m)
-			m = nil
+			cfg.log2("fd#%v -> %v\n", conn.RemoteAddr(), f)
+			readc <- f
 		}
-	}
-	cfg.log("eof on %d fid %d\n", c.fd.Fd(), fid.fid)
-	c.fd.Close()
-	if m != nil {
-		cfg.msgput(m)
-		cfg.msgput(m)
-	}
-	cfg.log("eof on %d fid %d ref %d\n", c.fd.Fd(), fid.fid, fid.ref)
-	fid.openfd--
-	if fid.openfd == 0 {
-		m = cfg.msgnew()
-		m.internal = true
-		m.c = c
-		m.tx.Type = plan9.Tclunk
-		m.tx.Tag = m.tag
-		m.tx.Fid = fid.fid
-		m.fid = fid
-		fid.ref++
-		cfg.msgincref(m)
-		cfg.sendomsg(m)
-		<-c.internal
-		cfg.msgput(m)
-		cfg.msgput(m)
-	}
-	cfg.fidput(fid)
-	c.fdfid = nil
-	c.internal = nil
-}
+		close(readc)
+	}()
 
-func (cfg *Config) xopenfd(m *msg) int {
-	p0, p1, err := p9p.Pipe()
-	if err != nil {
-		send9pError(m, err.Error())
-		/* XXX return here? */
-	}
-	cfg.log("xopen pipe %d %d...", p0.Fd(), p1.Fd())
-
-	// now we're committed.
-
-	// a new connection for this fid
-	nc := new(conn)
-	nc.internal = make(chan *msg)
-
-	/* a ref for us */
-	nc.fdfid = m.fid
-	m.fid.ref++
-	nc.fdfid.openfd++
-	nc.fdmode = m.tx.Mode
-	nc.fd = p0
-
-	// a thread to tend the pipe
-	go cfg.openfdthread(nc)
-
-	// if mode is ORDWR, that openfdthread will write; start a reader
-	if m.tx.Mode&3 == plan9.ORDWR {
-		nc := new(conn)
-		nc.internal = make(chan *msg)
-		nc.fdfid = m.fid
-		m.fid.ref++
-		nc.fdfid.openfd++
-		nc.fdmode = plan9.OREAD
-		//nc.fd = dup(p0, -1) 	how to avoid double close?
-		go cfg.openfdthread(nc)
+	c := &client{
+		tag:  make(map[uint16]*msg),
+		fid:  make(map[uint32]*fid),
+		outc: make(chan *msg, 1),
+		cfg:  cfg,
 	}
 
-	// steal fid from other connection
-	if cfg.deleteFid(m.c.fid, m.fid.cfid, m.fid) {
-		cfg.fidput(m.fid)
-	}
-
-	// rewrite as Ropenfd
-	m.rx.Type = p9p.Ropenfd
-	m.rx.Unixfd = uint32(p1.Fd())
-	return 0
-}
-
-func (cfg *Config) writeToClient(c *conn) {
-	for {
-		m := c.outq.recv()
-		if m == nil {
-			break
-		}
-		badType := m.tx.Type+1 != m.rx.Type
-		if !badType && m.isopenfd {
-			if cfg.xopenfd(m) < 0 {
+	for reading, writing := true, true; reading && writing; {
+		select {
+		case f := <-readc:
+			if f == nil { // EOF or error
+				reading = false
+				readc = nil
+				// Ask readFromServer to close c.outc.
+				cfg.outc <- &msg{tx: nil, rx: nil, outc: c.outc}
 				continue
 			}
-		}
-		switch m.tx.Type {
-		case plan9.Tflush:
-			om := m.oldm
-			if om != nil {
-				if cfg.deleteTag(om.c.tag, om.ctag, om) {
-					cfg.msgput(om)
-				}
+			m := cfg.msgnew()
+			m.tx = f
+			m.ctag = m.tx.Tag
+			m.outc = c.outc
+			cfg.log2("fd#%v: new msg %p\n", conn.RemoteAddr(), m)
+			if _, ok := c.tag[m.tx.Tag]; ok {
+				c.send9pError(m, "duplicate tag")
+				continue
 			}
+			c.tag[m.tx.Tag] = m
 
-		case plan9.Tclunk, plan9.Tremove:
-			if m.fid != nil {
-				if cfg.deleteFid(m.c.fid, m.fid.cfid, m.fid) {
-					cfg.fidput(m.fid)
-				}
-			}
+			c.processTx(m)
 
-		case plan9.Tauth:
-			if badType && m.afid != nil {
-				cfg.log("auth error\n")
-				if cfg.deleteFid(m.c.fid, m.afid.cfid, m.afid) {
-					cfg.fidput(m.afid)
-				}
+		case m := <-c.outc:
+			if m == nil {
+				writing = false
+				c.outc = nil
+				continue
 			}
-
-		case plan9.Tattach:
-			if badType && m.fid != nil {
-				if cfg.deleteFid(m.c.fid, m.fid.cfid, m.fid) {
-					cfg.fidput(m.fid)
-				}
-			}
-
-		case plan9.Twalk:
-			if badType || len(m.rx.Wqid) < len(m.tx.Wname) {
-				if m.tx.Fid != m.tx.Newfid && m.newfid != nil {
-					if cfg.deleteFid(m.c.fid, m.newfid.cfid, m.newfid) {
-						cfg.fidput(m.newfid)
-					}
-				}
-			}
-
-		case plan9.Tread:
-		case plan9.Tstat:
-		case plan9.Topen:
-		case plan9.Tcreate:
-		}
-		if cfg.deleteTag(m.c.tag, m.ctag, m) {
-			cfg.msgput(m)
-		}
-		cfg.log2("fd#%v <- %v\n", c.conn.RemoteAddr(), &m.rx)
-		rpkt, err := m.rx.Bytes()
-		if err != nil {
-			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
-		}
-		if _, err := c.conn.Write(rpkt); err != nil {
-			cfg.log("write error: %v\n", err)
-		}
-		if m.rx.Type == p9p.Ropenfd {
-			conn := m.c.conn.(*net.UnixConn)
-			if err := p9p.SendFD(conn, uintptr(m.rx.Unixfd)); err != nil {
-				cfg.log("sendfd failed: %v\n", err)
-			}
-		}
-		cfg.msgput(m)
-		if c.inputstalled && c.nmsg < maxMsgPerConn {
-			c.inc <- struct{}{}
+			c.processRx(conn, m)
 		}
 	}
-	c.outq = nil
-	c.outqdead <- struct{}{}
+	c.cleanup()
 }
 
-func (cfg *Config) writeToServer() {
+func (c *client) send9pError(m *msg, ename string) {
+	m.rx.Type = plan9.Rerror
+	m.rx.Ename = ename
+	m.rx.Tag = m.tx.Tag
+	c.outc <- m
+}
+
+func (c *client) processTx(m *msg) {
+	var ok bool
+	cfg := c.cfg
+
+	switch m.tx.Type {
+	default:
+		cfg.log("unknown fcall type %v", m.tx.Type)
+
+	case plan9.Tversion:
+		m.rx = &p9p.Fcall{}
+		m.rx.Tag = m.tx.Tag
+		m.rx.Msize = m.tx.Msize
+		if m.rx.Msize > cfg.msize {
+			m.rx.Msize = cfg.msize
+		}
+		m.rx.Version = "9P2000"
+		m.rx.Type = plan9.Rversion
+		c.outc <- m
+		return
+
+	case plan9.Tflush:
+		m.oldm, ok = c.tag[m.tx.Oldtag]
+		if !ok {
+			m.rx = &p9p.Fcall{}
+			m.rx.Tag = m.tx.Tag
+			m.rx.Type = plan9.Rflush
+			c.outc <- m
+			return
+		}
+
+	case plan9.Tattach:
+		m.afid = nil
+		if m.tx.Afid != plan9.NOFID {
+			m.afid, ok = c.fid[m.tx.Afid]
+			if !ok {
+				c.send9pError(m, "unknown fid")
+				return
+			}
+		}
+		m.fid = cfg.fidnew(m.tx.Fid)
+		if _, ok := c.fid[m.tx.Fid]; ok {
+			c.send9pError(m, "duplicate fid")
+			return
+		}
+		c.fid[m.tx.Fid] = m.fid
+
+	case plan9.Twalk:
+		m.fid, ok = c.fid[m.tx.Fid]
+		if !ok {
+			c.send9pError(m, "unknown fid")
+			return
+		}
+		if m.tx.Newfid == m.tx.Fid {
+			m.newfid = m.fid
+		} else {
+			m.newfid = cfg.fidnew(m.tx.Newfid)
+			if _, ok := c.fid[m.tx.Newfid]; ok {
+				c.send9pError(m, "duplicate fid")
+				return
+			}
+			c.fid[m.tx.Newfid] = m.newfid
+		}
+
+	case plan9.Tauth:
+		if cfg.NoAuth {
+			c.send9pError(m, "authentication rejected")
+			return
+		}
+		m.afid = cfg.fidnew(m.tx.Afid)
+		if _, ok := c.fid[m.tx.Afid]; ok {
+			c.send9pError(m, "duplicate fid")
+			return
+		}
+		c.fid[m.tx.Afid] = m.afid
+
+	case plan9.Tcreate:
+		if m.tx.Perm&(plan9.DMSYMLINK|plan9.DMDEVICE|plan9.DMNAMEDPIPE|plan9.DMSOCKET) != 0 {
+			c.send9pError(m, "unsupported file type")
+			return
+		}
+		fallthrough
+	case plan9.Topen, plan9.Tclunk, plan9.Tread, plan9.Twrite, plan9.Tremove, plan9.Tstat, plan9.Twstat:
+		m.fid, ok = c.fid[m.tx.Fid]
+		if !ok {
+			c.send9pError(m, "unknown fid")
+			return
+		}
+	}
+
+	// have everything - translate and send
+	m.ctag = m.tx.Tag
+	m.tx.Tag = m.tag
+	if m.fid != nil {
+		m.tx.Fid = m.fid.fid
+	}
+	if m.newfid != nil {
+		m.tx.Newfid = m.newfid.fid
+	}
+	if m.afid != nil {
+		m.tx.Afid = m.afid.fid
+	}
+	if m.oldm != nil {
+		m.tx.Oldtag = m.oldm.tag
+	}
+	// reference passes to outq
+	cfg.outc <- m
+}
+
+func (c *client) cleanup() {
+	cfg := c.cfg
+
+	internalc := make(chan *msg)
+
+	// flush all outstanding messages
+	for _, om := range c.tag {
+		m := cfg.msgnew()
+		m.tx = &p9p.Fcall{}
+		m.tx.Type = plan9.Tflush
+		m.tx.Tag = m.tag
+		m.tx.Oldtag = om.tag
+		m.oldm = om
+		m.outc = internalc
+		cfg.outc <- m
+		mm := <-internalc
+		assert(mm == m)
+		cfg.msgput(m) // got from msgnew
+		if c.deleteTag(om.ctag, om) {
+			cfg.msgput(om)
+		}
+	}
+
+	// clunk all outstanding fids
+	for _, f := range c.fid {
+		m := cfg.msgnew()
+		m.tx = &p9p.Fcall{}
+		m.tx.Type = plan9.Tclunk
+		m.tx.Tag = m.tag
+		m.tx.Fid = f.fid
+		m.fid = f
+		m.outc = internalc
+		cfg.outc <- m
+		mm := <-internalc
+		assert(mm == m)
+		cfg.msgput(m) // got from msgnew
+		if c.deleteFid(m.fid.cfid, f) {
+			cfg.fidput(f)
+		}
+	}
+
+	assert(len(c.tag) == 0)
+	assert(len(c.fid) == 0)
+}
+
+func (c *client) processRx(conn net.Conn, m *msg) {
+	cfg := c.cfg
+
+	badType := m.tx.Type+1 != m.rx.Type
+	switch m.tx.Type {
+	case plan9.Tflush:
+		om := m.oldm
+		if om != nil {
+			if c.deleteTag(om.ctag, om) {
+				cfg.msgput(om)
+			}
+		}
+
+	case plan9.Tclunk, plan9.Tremove:
+		if m.fid != nil {
+			if c.deleteFid(m.fid.cfid, m.fid) {
+				cfg.fidput(m.fid)
+			}
+		}
+
+	case plan9.Tauth:
+		if badType && m.afid != nil {
+			cfg.log("auth error\n")
+			if c.deleteFid(m.afid.cfid, m.afid) {
+				cfg.fidput(m.afid)
+			}
+		}
+
+	case plan9.Tattach:
+		if badType && m.fid != nil {
+			if c.deleteFid(m.fid.cfid, m.fid) {
+				cfg.fidput(m.fid)
+			}
+		}
+
+	case plan9.Twalk:
+		if badType || len(m.rx.Wqid) < len(m.tx.Wname) {
+			if m.tx.Fid != m.tx.Newfid && m.newfid != nil {
+				if c.deleteFid(m.newfid.cfid, m.newfid) {
+					cfg.fidput(m.newfid)
+				}
+			}
+		}
+
+	case plan9.Tread:
+	case plan9.Tstat:
+	case plan9.Topen:
+	case plan9.Tcreate:
+	}
+	if c.deleteTag(m.ctag, m) {
+		cfg.msgput(m)
+	}
+	cfg.log2("fd#%v <- %v\n", conn.RemoteAddr(), m.rx)
+	rpkt, err := m.rx.Bytes()
+	if err != nil {
+		log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
+	}
+	if _, err := conn.Write(rpkt); err != nil {
+		cfg.log("write error: %v\n", err)
+	}
+	cfg.msgput(m)
+}
+
+func (cfg *Config) writeToServer(srv io.ReadWriter) {
 	for {
-		m := cfg.outq.recv()
-		if m == nil {
+		m := <-cfg.outc
+		if m == nil { // all clients have disconnected
 			break
 		}
-		if m.sync {
-			m.c.outqdead <- struct{}{}
+		if m.tx == nil {
+			// The client for this message has closed the connection.
+			close(m.outc)
 			continue
 		}
-		cfg.log2("* <- %v\n", &m.tx)
+		cfg.log2("* <- %v\n", m.tx)
 		tpkt, err := m.tx.Bytes()
 		if err != nil {
 			log.Fatalf("failed to convert Fcall to bytes: %v\n", err)
 		}
-		if _, err := cfg.srv.Write(tpkt); err != nil {
+		if _, err := srv.Write(tpkt); err != nil {
 			log.Fatalf("output error: %s\n", err)
 		}
-		cfg.msgput(m)
 	}
-	log.Printf("output eof\n")
-	// TODO(fhs): The C code exited the program here.
-	// Since we will not exit, do we need to clean up things instead?
-	//os.Exit(0)
 }
 
-func (cfg *Config) readFromServer() {
+func (cfg *Config) readFromServer(srv io.ReadWriter) {
 	cfg.log("input thread\n")
 
 	for {
-		f, err := plan9.ReadFcall(cfg.srv)
+		f, err := p9p.ReadFcall(srv)
 		if err == io.EOF {
 			break
 		}
@@ -729,123 +500,74 @@ func (cfg *Config) readFromServer() {
 			log.Printf("unexpected 9P response tag %v\n", f.Tag)
 			continue
 		}
-		m.rx = p9p.Fcall{Fcall: *f}
-		cfg.log2("* -> %v internal=%v\n", &m.rx, m.internal)
+		m.rx = f
+		cfg.log2("* -> %v\n", m.rx)
 		m.rx.Tag = m.ctag
-		if m.internal {
-			m.c.internal <- m
-		} else if m.c.outq != nil {
-			m.c.outq.send(m)
-		} else {
-			cfg.msgput(m)
-		}
+		m.outc <- m
 	}
-	// TODO(fhs): The C code exited the program here.
-	// Since we will not exit, do we need to clean up things instead?
-	//os.Exit(0)
 }
 
 func (cfg *Config) fidnew(cfid uint32) *fid {
-	if cfg.freefid == nil {
-		cfg.freefid = &fid{
-			fid: uint32(len(cfg.fidtab)),
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if len(cfg.freefid) > 0 {
+		n := len(cfg.freefid) - 1
+		f := cfg.freefid[n]
+		cfg.freefid = cfg.freefid[:n]
+
+		// clear everything except global fid and cfid
+		*f = fid{
+			fid:  f.fid,
+			cfid: cfid,
 		}
-		cfg.fidtab = append(cfg.fidtab, cfg.freefid)
+		return f
 	}
-	f := cfg.freefid
-	cfg.freefid = f.next
-	f.cfid = cfid
-	f.ref = 1
+
+	f := &fid{
+		fid:  uint32(len(cfg.fidtab)),
+		cfid: cfid,
+	}
+	cfg.fidtab = append(cfg.fidtab, f)
 	return f
 }
 
 func (cfg *Config) fidput(f *fid) {
-	if f == nil {
-		return
-	}
-	assert(f.ref > 0)
-	f.ref--
-	if f.ref > 0 {
-		return
-	}
-	f.next = cfg.freefid
-	f.cfid = ^uint32(0)
-	cfg.freefid = f
-}
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
 
-func (cfg *Config) msgincref(m *msg) {
-	cfg.log2("msgincref %p tag %d/%d ref %d=>%d\n",
-		m, m.tag, m.ctag, m.ref, m.ref+1)
-	m.ref++
+	cfg.freefid = append(cfg.freefid, f)
 }
 
 func (cfg *Config) msgnew() *msg {
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 
-	if cfg.freemsg == nil {
-		cfg.freemsg = &msg{
-			tag: uint16(len(cfg.msgtab)),
-		}
-		cfg.msgtab = append(cfg.msgtab, cfg.freemsg)
+	if len(cfg.freemsg) > 0 {
+		n := len(cfg.freemsg) - 1
+		m := cfg.freemsg[n]
+		cfg.freemsg = cfg.freemsg[:n]
+
+		// clear everything except the tag
+		tag := m.tag
+		*m = msg{}
+		m.tag = tag
+		return m
 	}
-	m := cfg.freemsg
-	cfg.freemsg = m.next
-	m.ref = 1
-	cfg.log2("msgnew %p tag %d ref %d\n", m, m.tag, m.ref)
+	m := &msg{
+		tag: uint16(len(cfg.msgtab)),
+	}
+	cfg.msgtab = append(cfg.msgtab, m)
+	cfg.log2("msgnew %p tag %d\n", m, m.tag)
 	return m
 }
 
-// msgclear clears data associated with connections, so that
-// if all msgs have been msgcleared, the connection can be freed.
-// The io write thread might still be holding a ref to msg
-// even once the connection has finished with it.
-func (cfg *Config) msgclear(m *msg) {
-	if m.c != nil {
-		m.c.nmsg--
-		m.c = nil
-	}
-	if m.oldm != nil {
-		cfg.msgput(m.oldm)
-		m.oldm = nil
-	}
-	if m.fid != nil {
-		cfg.fidput(m.fid)
-		m.fid = nil
-	}
-	if m.afid != nil {
-		cfg.fidput(m.afid)
-		m.afid = nil
-	}
-	if m.newfid != nil {
-		cfg.fidput(m.newfid)
-		m.newfid = nil
-	}
-	if m.rx.Type == p9p.Ropenfd && m.rx.Unixfd >= 0 {
-		os.NewFile(uintptr(m.rx.Unixfd), "|1").Close()
-		m.rx.Unixfd = ^uint32(0)
-	}
-}
-
 func (cfg *Config) msgput(m *msg) {
-	if m == nil {
-		return
-	}
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 
-	cfg.log2("msgput %p tag %d/%d ref %d\n",
-		m, m.tag, m.ctag, m.ref)
-	assert(m.ref > 0)
-	m.ref--
-	if m.ref > 0 {
-		return
-	}
-	cfg.msgclear(m)
-	m.isopenfd = false
-	m.internal = false
-	m.next = cfg.freemsg
-	cfg.freemsg = m
+	cfg.log2("msgput %p tag %d/%d\n", m, m.tag, m.ctag)
+	cfg.freemsg = append(cfg.freemsg, m)
 }
 
 func (cfg *Config) msgget(n int) *msg {
@@ -856,86 +578,9 @@ func (cfg *Config) msgget(n int) *msg {
 		return nil
 	}
 	m := cfg.msgtab[n]
-	if m.ref == 0 {
-		return nil
-	}
 	cfg.log("msgget %d = %p\n", n, m)
-	cfg.msgincref(m)
 	return m
 }
-
-type qElem struct {
-	next *qElem
-	p    *msg
-}
-
-type queue struct {
-	lk   sync.Mutex
-	r    *sync.Cond
-	head *qElem
-	tail *qElem
-}
-
-func newQueue() *queue {
-	var q queue
-	q.r = sync.NewCond(&q.lk)
-	return &q
-}
-
-func (q *queue) send(p *msg) int {
-	var e qElem
-
-	q.lk.Lock()
-	e.p = p
-	e.next = nil
-	if q.head == nil {
-		q.head = &e
-	} else {
-		q.tail.next = &e
-	}
-	q.tail = &e
-	q.r.Signal()
-	q.lk.Unlock()
-	return 0
-}
-
-func (q *queue) recv() *msg {
-	q.lk.Lock()
-	for q.head == nil {
-		q.r.Wait()
-	}
-	e := q.head
-	q.head = e.next
-	q.lk.Unlock()
-	p := e.p
-	return p
-}
-
-func (cfg *Config) mread9p(r io.Reader) (*msg, error) {
-	f, err := p9p.ReadFcall(r)
-	if err != nil {
-		return nil, err
-	}
-	m := cfg.msgnew()
-	m.tx = *f
-	return m, nil
-}
-
-/*
-int
-ignorepipe(void *v, char *s)
-{
-	USED(v);
-	if(strcmp(s, "sys: write on closed pipe") == 0)
-		return 1;
-	if(strcmp(s, "sys: tstp") == 0)
-		return 1;
-	if(strcmp(s, "sys: window size change") == 0)
-		return 1;
-	fprint(2, "9pserve %s: note: %s\n", addr, s);
-	return 0;
-}
-*/
 
 func (cfg *Config) log(format string, a ...interface{}) {
 	if cfg.LogLevel > 0 {
@@ -955,23 +600,23 @@ func assert(b bool) {
 	}
 }
 
-func (cfg *Config) deleteTag(tab map[uint16]*msg, tag uint16, m *msg) bool {
-	if m1, ok := tab[tag]; ok {
+func (c *client) deleteTag(tag uint16, m *msg) bool {
+	if m1, ok := c.tag[tag]; ok {
 		if m1 != m {
-			cfg.log("deleteTag %d got %p want %p\n", tag, m1, m)
+			c.cfg.log("deleteTag %d got %p want %p\n", tag, m1, m)
 		}
-		delete(tab, tag)
+		delete(c.tag, tag)
 		return true
 	}
 	return false
 }
 
-func (cfg *Config) deleteFid(tab map[uint32]*fid, fid uint32, f *fid) bool {
-	if f1, ok := tab[fid]; ok {
+func (c *client) deleteFid(fid uint32, f *fid) bool {
+	if f1, ok := c.fid[fid]; ok {
 		if f1 != f {
-			cfg.log("deleteFid %d got %p want %p\n", fid, f1, f)
+			c.cfg.log("deleteFid %d got %p want %p\n", fid, f1, f)
 		}
-		delete(tab, fid)
+		delete(c.fid, fid)
 		return true
 	}
 	return false
