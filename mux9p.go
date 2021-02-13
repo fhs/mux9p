@@ -25,6 +25,7 @@ package mux9p
 //		write msg.rx to client
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -50,6 +51,9 @@ type Config struct {
 	// Logs are not written if it's 0.
 	// It can be overridden with environment variable verbose9pserve.
 	LogLevel int
+
+	// Options for the listener.
+	ListenConfig net.ListenConfig
 
 	msize     uint32 // 9P message size
 	versioned bool   // Do not initialize the connection with a Tversion
@@ -90,9 +94,15 @@ type client struct {
 // Listen creates a listener at the given network and address,
 // accepts 9P clients from it and mutiplexes them into 9P server srv.
 func Listen(network, address string, srv io.ReadWriter, cfg *Config) error {
-	ln, err := net.Listen(network, address)
+	return ListenContext(context.Background(), network, address, srv, cfg)
+}
+
+// ListenContext is equivalent to Listen but with a context.
+func ListenContext(ctx context.Context, network, address string, srv io.ReadWriter, cfg *Config) error {
+	ln, err := cfg.ListenConfig.Listen(ctx, network, address)
 	if err != nil && network == "unix" && isAddrInUse(err) {
-		if _, err1 := net.Dial(network, address); !isConnRefused(err1) {
+		var d net.Dialer
+		if _, err1 := d.DialContext(ctx, network, address); !isConnRefused(err1) {
 			return err // Listen error
 		}
 		// Dead socket, so remove it.
@@ -100,7 +110,7 @@ func Listen(network, address string, srv io.ReadWriter, cfg *Config) error {
 		if err != nil {
 			return err
 		}
-		ln, err = net.Listen(network, address)
+		ln, err = cfg.ListenConfig.Listen(ctx, network, address)
 	}
 	if err != nil {
 		return err
