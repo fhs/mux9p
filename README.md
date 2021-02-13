@@ -1,5 +1,5 @@
-[![Build Status](https://travis-ci.com/fhs/mux9p.svg?branch=master)](https://travis-ci.com/fhs/mux9p)
-[![GoDoc](https://godoc.org/github.com/fhs/mux9p?status.svg)](https://godoc.org/github.com/fhs/mux9p)
+[![mux9p](https://github.com/fhs/mux9p/workflows/mux9p/badge.svg?event=push)](https://github.com/fhs/mux9p/actions?query=workflow%3Amux9p+event%3Apush)
+[![GoDoc](https://godocs.io/github.com/fhs/mux9p?status.svg)](https://godocs.io/github.com/fhs/mux9p)
 [![Go Report Card](https://goreportcard.com/badge/github.com/fhs/mux9p)](https://goreportcard.com/report/github.com/fhs/mux9p)
 
 ## Overview
