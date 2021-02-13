@@ -68,14 +68,15 @@ type fid struct {
 }
 
 type msg struct {
-	tx, rx *p9p.Fcall
-	ctag   uint16 // Conn's tag
-	tag    uint16 // unique tag over all Conns
-	outc   chan *msg
-	fid    *fid // Tattach, Twalk, etc.
-	newfid *fid // Twalk Newfid
-	afid   *fid // Tauth Fid
-	oldm   *msg // msg corresponding to Tflush Oldtag
+	ctag     uint16     // Conn's tag
+	tag      uint16     // unique tag over all Conns
+	isopenfd bool       // Topenfd message
+	tx, rx   *p9p.Fcall // transmit/receive 9P message
+	outc     chan *msg  // server handler sends response to this channel
+	fid      *fid       // Tattach, Twalk, etc.
+	newfid   *fid       // Twalk Newfid
+	afid     *fid       // Tauth Fid
+	oldm     *msg       // msg corresponding to Tflush Oldtag
 }
 
 type client struct {
@@ -225,7 +226,8 @@ func (cfg *Config) clientIO(conn net.Conn) {
 			}
 			c.tag[m.tx.Tag] = m
 
-			c.processTx(m)
+			_, allowOpenfd := conn.(*net.UnixConn)
+			c.processTx(m, allowOpenfd)
 
 		case m := <-c.outc:
 			if m == nil {
@@ -246,7 +248,7 @@ func (c *client) send9pError(m *msg, ename string) {
 	c.outc <- m
 }
 
-func (c *client) processTx(m *msg) {
+func (c *client) processTx(m *msg, allowOpenfd bool) {
 	var ok bool
 	cfg := c.cfg
 
@@ -320,6 +322,23 @@ func (c *client) processTx(m *msg) {
 			return
 		}
 		c.fid[m.tx.Afid] = m.afid
+
+	case p9p.Topenfd:
+		if !allowOpenfd {
+			c.send9pError(m, "only supported on unix socket")
+			return
+		}
+		if m.tx.Mode&^(plan9.OTRUNC|3) != 0 {
+			c.send9pError(m, "bad openfd mode")
+			return
+		}
+		m.isopenfd = true
+		m.tx.Type = plan9.Topen
+		m.fid, ok = c.fid[m.tx.Fid]
+		if !ok {
+			c.send9pError(m, "unknown fid")
+			return
+		}
 
 	case plan9.Tcreate:
 		if m.tx.Perm&(plan9.DMSYMLINK|plan9.DMDEVICE|plan9.DMNAMEDPIPE|plan9.DMSOCKET) != 0 {
@@ -399,10 +418,150 @@ func (c *client) cleanup() {
 	assert(len(c.fid) == 0)
 }
 
+// writeToPipe copies data from fid to pipe.
+func (cfg *Config) writeToPipe(fid uint32, pipe io.Writer) {
+	ch := make(chan *msg)
+	tot := uint64(0)
+	for {
+		cfg.log("tread...")
+		m := cfg.msgnew()
+		m.tx = &p9p.Fcall{}
+		m.tx.Type = plan9.Tread
+		m.tx.Count = cfg.msize - plan9.IOHDRSZ
+		m.tx.Fid = fid
+		m.tx.Tag = m.tag
+		m.tx.Offset = tot
+		m.outc = ch
+		cfg.outc <- m
+		m = <-ch
+		if m.rx.Type == plan9.Rerror {
+			cfg.log("read error: %s\n", m.rx.Ename)
+			break
+		}
+		if m.rx.Count == 0 {
+			break
+		}
+		tot += uint64(m.rx.Count)
+		if _, err := pipe.Write(m.rx.Data[:m.rx.Count]); err != nil {
+			cfg.log("pipe write error: %v\n", err)
+			break
+		}
+		cfg.msgput(m)
+	}
+}
+
+func (cfg *Config) readFromPipe(fid uint32, pipe io.Reader) {
+	var buf [1024]byte
+
+	ch := make(chan *msg)
+	tot := uint64(0)
+	for {
+		cfg.log("twrite...")
+		n := len(buf)
+		if n > int(cfg.msize) {
+			n = int(cfg.msize)
+		}
+		cfg.log("openfd reading %v bytes...", n)
+		n, err := pipe.Read(buf[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			cfg.log("pipe read error: %v\n", err)
+		}
+		cfg.log("openfd read: %v", string(buf[:n]))
+		m := cfg.msgnew()
+		m.tx = &p9p.Fcall{}
+		m.tx.Type = plan9.Twrite
+		m.tx.Fid = fid
+		m.tx.Data = buf[:]
+		m.tx.Count = uint32(n)
+		m.tx.Tag = m.tag
+		m.tx.Offset = tot
+		m.outc = ch
+		ch <- m
+		m = <-ch
+		if m.rx.Type == plan9.Rerror {
+			cfg.log("write error: %s\n", m.rx.Ename)
+		}
+		tot += uint64(n)
+		cfg.msgput(m)
+		m = nil
+	}
+}
+
+func (cfg *Config) pipeIO(mode uint8, fdfid *fid, pipe *os.File) {
+	var wg sync.WaitGroup
+
+	mo := mode & 3
+	if mo == plan9.OREAD || mo == plan9.ORDWR {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfg.writeToPipe(fdfid.fid, pipe)
+		}()
+	}
+	if mo == plan9.OWRITE || mo == plan9.ORDWR {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfg.readFromPipe(fdfid.fid, pipe)
+		}()
+	}
+
+	wg.Wait()
+
+	cfg.log("eof on %d fid %d\n", pipe.Fd(), fdfid.fid)
+	pipe.Close()
+
+	cfg.log("eof on %d fid %d\n", pipe.Fd(), fdfid.fid)
+	ch := make(chan *msg)
+	m := cfg.msgnew()
+	m.tx = &p9p.Fcall{}
+	m.tx.Type = plan9.Tclunk
+	m.tx.Tag = m.tag
+	m.tx.Fid = fdfid.fid
+	m.fid = fdfid
+	m.outc = ch
+	cfg.outc <- m
+	m = <-ch
+	cfg.msgput(m)
+	cfg.fidput(m.fid)
+}
+
+func (c *client) xopenfd(conn net.Conn, m *msg) error {
+	cfg := c.cfg
+
+	p0, p1, err := p9p.Pipe()
+	if err != nil {
+		return err
+	}
+	cfg.log("xopen pipe %d %d...", p0.Fd(), p1.Fd())
+
+	// now we're committed.
+
+	// Client considers the fid to be clunked.
+	// Delete fid from client but keep in the server.
+	c.deleteFid(m.fid.cfid, m.fid)
+
+	go cfg.pipeIO(m.tx.Mode, m.fid, p0)
+
+	// rewrite as Ropenfd
+	m.rx.Type = p9p.Ropenfd
+	m.rx.Unixfd = uint32(p1.Fd())
+	return nil
+}
+
 func (c *client) processRx(conn net.Conn, m *msg) {
 	cfg := c.cfg
 
 	badType := m.tx.Type+1 != m.rx.Type
+	if !badType && m.isopenfd {
+		if err := c.xopenfd(conn, m); err != nil {
+			c.send9pError(m, err.Error())
+			return
+		}
+	}
 	switch m.tx.Type {
 	case plan9.Tflush:
 		om := m.oldm
@@ -448,9 +607,6 @@ func (c *client) processRx(conn net.Conn, m *msg) {
 	case plan9.Topen:
 	case plan9.Tcreate:
 	}
-	if c.deleteTag(m.ctag, m) {
-		cfg.msgput(m)
-	}
 	cfg.log2("fd#%v <- %v\n", conn.RemoteAddr(), m.rx)
 	rpkt, err := m.rx.Bytes()
 	if err != nil {
@@ -459,7 +615,14 @@ func (c *client) processRx(conn net.Conn, m *msg) {
 	if _, err := conn.Write(rpkt); err != nil {
 		cfg.log("write error: %v\n", err)
 	}
-	cfg.msgput(m)
+	if m.rx.Type == p9p.Ropenfd {
+		if err := p9p.SendFD(conn.(*net.UnixConn), uintptr(m.rx.Unixfd)); err != nil {
+			cfg.log("sendfd failed: %v\n", err)
+		}
+	}
+	if c.deleteTag(m.ctag, m) {
+		cfg.msgput(m)
+	}
 }
 
 func (cfg *Config) writeToServer(srv io.ReadWriter) {
@@ -578,7 +741,6 @@ func (cfg *Config) msgget(n int) *msg {
 		return nil
 	}
 	m := cfg.msgtab[n]
-	cfg.log("msgget %d = %p\n", n, m)
 	return m
 }
 

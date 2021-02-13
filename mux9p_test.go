@@ -69,25 +69,19 @@ var testLog = []fcallMsg{
 	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rwalk, Tag: 2, Wqid: []plan9.Qid{{Path: 1, Vers: 0, Type: 0}}}}},
 
 	// Server sees a Topenfd as Topen
-	//{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Topenfd, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
-	//{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Topen, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
-	//{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Ropen, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}}},
-	//{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Ropenfd, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}, Unixfd: 3}},
+	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Topenfd, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Topen, Tag: 2, Fid: 2, Mode: plan9.OREAD}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Ropen, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}}},
+	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: p9p.Ropenfd, Tag: 2, Qid: plan9.Qid{Path: 1, Vers: 0, Type: plan9.QTDIR}, Iounit: 1024}, Unixfd: 3}},
 
 	// mux will read for client for the openfd pipe. Server sends EOF and mux clunks the fid.
-	//{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tread, Tag: 2, Fid: 2, Offset: 0, Count: 8068}}},
-	//{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rread, Tag: 2, Count: 0, Data: nil}}},
-	//{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 2, Fid: 2}}},
-	//{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 2}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tread, Tag: 2, Fid: 2, Offset: 0, Count: 8068}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rread, Tag: 2, Count: 0, Data: nil}}},
+	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 2, Fid: 2}}},
+	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 2}}},
 
 	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}}},
 	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 1}}},
-	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
-	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
-
-	// TODO: remove once openfd is implemented again.
-	{kind: CW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 2}}},
-	{kind: SR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Tclunk, Tag: 0, Fid: 2}}},
 	{kind: SW, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
 	{kind: CR, f: p9p.Fcall{Fcall: plan9.Fcall{Type: plan9.Rclunk, Tag: 0}}},
 }
