@@ -8,20 +8,21 @@ package mux9p
 
 // Life cycle of a 9P message:
 //
-// 1. readFromClient:
-//		read from conn into msg.tx
+// 1. clientIO/processTx:
+//		read from client into msg.tx
 //		write global tags and fids to msg.tx
-//		send msg to Config.outq
+//		set msg.outc to a response channel
+//		send msg to Config.outc
 // 2. writeToServer:
-//		receive from Config.outq
-//		write msg.tx to Config.srv
+//		receive from Config.outc
+//		write msg.tx to server
 // 3. readFromServer:
-//		read from Config.srv into msg.rx
-//		write conn's tag to msg.rx
-//		send msg to conn.outq
-// 4. writeToClient:
-//		receive from conn.outq
-//		write msg.rx to conn
+//		read from server into msg.rx
+//		write client's tag to msg.rx
+//		send msg to msg.outc
+// 4. clientIO/processRx:
+//		receive msg from the response channel
+//		write msg.rx to client
 
 import (
 	"fmt"
@@ -64,12 +65,12 @@ type Config struct {
 
 type fid struct {
 	fid  uint32 // global fid
-	cfid uint32 // Conn's fid
+	cfid uint32 // client's fid
 }
 
 type msg struct {
-	ctag     uint16     // Conn's tag
-	tag      uint16     // unique tag over all Conns
+	ctag     uint16     // client's tag
+	tag      uint16     // unique tag over all clients
 	isopenfd bool       // Topenfd message
 	tx, rx   *p9p.Fcall // transmit/receive 9P message
 	outc     chan *msg  // server handler sends response to this channel
@@ -80,8 +81,8 @@ type msg struct {
 }
 
 type client struct {
-	tag  map[uint16]*msg // conn tag → global tag
-	fid  map[uint32]*fid // conn fid → global fid
+	tag  map[uint16]*msg // client tag → global tag
+	fid  map[uint32]*fid // client fid → global fid
 	outc chan *msg       // msg queued for write to 9P client
 	cfg  *Config
 }
@@ -130,7 +131,6 @@ func Do(ln net.Listener, srv io.ReadWriter, cfg *Config) error {
 
 func (cfg *Config) mainproc(srv io.ReadWriter, ln net.Listener) error {
 	cfg.log("9pserve running\n")
-	//atnotify(ignorepipe, 1)
 
 	if !cfg.versioned {
 		f := &plan9.Fcall{
@@ -369,7 +369,6 @@ func (c *client) processTx(m *msg, allowOpenfd bool) {
 	if m.oldm != nil {
 		m.tx.Oldtag = m.oldm.tag
 	}
-	// reference passes to outq
 	cfg.outc <- m
 }
 
@@ -486,7 +485,6 @@ func (cfg *Config) readFromPipe(fid uint32, pipe io.Reader) {
 		}
 		tot += uint64(n)
 		cfg.msgput(m)
-		m = nil
 	}
 }
 
@@ -540,10 +538,6 @@ func (c *client) xopenfd(conn net.Conn, m *msg) error {
 
 	// now we're committed.
 
-	// Client considers the fid to be clunked.
-	// Delete fid from client but keep in the server.
-	c.deleteFid(m.fid.cfid, m.fid)
-
 	go cfg.pipeIO(m.tx.Mode, m.fid, p0)
 
 	// rewrite as Ropenfd
@@ -561,6 +555,9 @@ func (c *client) processRx(conn net.Conn, m *msg) {
 			c.send9pError(m, err.Error())
 			return
 		}
+		// Client considers the fid to be clunked.
+		// Delete fid from client but keep in the server.
+		c.deleteFid(m.fid.cfid, m.fid)
 	}
 	switch m.tx.Type {
 	case plan9.Tflush:
@@ -712,9 +709,9 @@ func (cfg *Config) msgnew() *msg {
 		cfg.freemsg = cfg.freemsg[:n]
 
 		// clear everything except the tag
-		tag := m.tag
-		*m = msg{}
-		m.tag = tag
+		*m = msg{
+			tag: m.tag,
+		}
 		return m
 	}
 	m := &msg{
