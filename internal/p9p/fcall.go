@@ -52,6 +52,7 @@ import (
 	"9fans.net/go/plan9"
 )
 
+// The openfd 9P message type is from plan9port (see openfd(9)).
 const (
 	Topenfd = 98 + iota
 	Ropenfd
@@ -131,7 +132,7 @@ func ReadFcall(r io.Reader) (*Fcall, error) {
 	return fc, nil
 }
 
-// Bytes unmarshals a Fcall.
+// UnmarshalFcall unmarshals a Fcall.
 func UnmarshalFcall(b []byte) (f *Fcall, err error) {
 	ob := b[:]
 	n, b := gbit32(b)
